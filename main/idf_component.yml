@@ -1,0 +1,9 @@
+## IDF Component Manager Manifest File
+dependencies:
+  ## Required IDF version
+  idf:
+    version: '>=4.1.0'
+  espressif/esp_h264: ^1.2.0~1
+  espressif/esp_jpeg: "*"
+  waveshare/esp_lcd_st7703: "*"
+  espressif/esp_media_protocols: "*"

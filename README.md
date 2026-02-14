@@ -1,53 +1,36 @@
-| Supported Targets | ESP32 | ESP32-C2 | ESP32-C3 | ESP32-C5 | ESP32-C6 | ESP32-C61 | ESP32-H2 | ESP32-H21 | ESP32-H4 | ESP32-P4 | ESP32-S2 | ESP32-S3 | Linux |
-| ----------------- | ----- | -------- | -------- | -------- | -------- | --------- | -------- | --------- | -------- | -------- | -------- | -------- | ----- |
+# PocketStream
 
-# Hello World Example
+An RTSP Streamer for an ESP32-P4 with TFT LCD Screen. 
 
-Starts a FreeRTOS task to print "Hello World".
+## Requirements
 
-(See the README.md file in the upper level 'examples' directory for more information about examples.)
+- [MediaMTX](https://mediamtx.org/docs/kickoff/install)
+- [FFMPEG 8.0](https://www.gyan.dev/ffmpeg/builds/)
+- [ESP32-P4-86-Panel-ETH_2RO](https://www.waveshare.com/wiki/ESP32-P4-86-Panel-ETH-2RO?srsltid=AfmBOoqReADqAAzaexSXP_GqkmBIrQq-UnQoV5d3tfqgrQohuafg43F3)
+- [ESP-IDF 5.5.2](https://docs.espressif.com/projects/esp-idf/en/stable/esp32/versions.html)
 
-## How to use example
+## Usage
 
-Follow detailed instructions provided specifically for this example.
+This project will configure the ESP32-P4 TFT Screen to connect to the local Ethernet network and play an RTSP stream at the endpoint `rtsp://10.0.0.1:8554/live`. This endpoint is configured in `main.c`. 
 
-Select the instructions depending on Espressif chip installed on your development board:
+In this particular example `ffmpeg` is used to create a testpattern in the file [stream_rtsp_testpattern_esp32_720.ps1](commands/stream_rtsp_testpattern_esp32_720.ps1) and publish the output to a local RTSP service. The local RTSP service is run with [MediaMTX](https://mediamtx.org/docs/kickoff/install). 
 
-- [ESP32 Getting Started Guide](https://docs.espressif.com/projects/esp-idf/en/stable/get-started/index.html)
-- [ESP32-S2 Getting Started Guide](https://docs.espressif.com/projects/esp-idf/en/latest/esp32s2/get-started/index.html)
+- Build / Flash / Monitor project to the ESP32-P4 device 
+- Run process `./mediamtx`
+- Run FFMPEG `stream_rtsp_testpattern_esp32_720.ps1` as a separate process to publish to the RTSP service
 
+### Result
 
-## Example folder contents
+The ESP32-P4 device will display the RTSP stream on the device. 
 
-The project **hello_world** contains one source file in C language [hello_world_main.c](main/hello_world_main.c). The file is located in folder [main](main).
-
-ESP-IDF projects are built using CMake. The project build configuration is contained in `CMakeLists.txt` files that provide set of directives and instructions describing the project's source files and targets (executable, library, or both).
-
-Below is short explanation of remaining files in the project folder.
-
+## Project Structure
 ```
 ├── CMakeLists.txt
-├── pytest_hello_world.py      Python script used for automated testing
 ├── main
 │   ├── CMakeLists.txt
-│   └── hello_world_main.c
-└── README.md                  This is the file you are currently reading
+│   ├── Project files
+│   └── main.c
+├── commands
+│   ├── stream_rtsp_testpattern_esp32_720.ps1
+└── README.md
 ```
-
-For more information on structure and contents of ESP-IDF projects, please refer to Section [Build System](https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-guides/build-system.html) of the ESP-IDF Programming Guide.
-
-## Troubleshooting
-
-* Program upload failure
-
-    * Hardware connection is not correct: run `idf.py -p PORT monitor`, and reboot your board to see if there are any output logs.
-    * The baud rate for downloading is too high: lower your baud rate in the `menuconfig` menu, and try again.
-
-## Technical support and feedback
-
-Please use the following feedback channels:
-
-* For technical queries, go to the [esp32.com](https://esp32.com/) forum
-* For a feature request or bug report, create a [GitHub issue](https://github.com/espressif/esp-idf/issues)
-
-We will get back to you as soon as possible.

@@ -10,6 +10,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
@@ -22,7 +23,7 @@
 #include "h264.h"
 #include "yuv_rgb.h"
 
-static const char *TAG = "RTSP_MANUAL";
+static const char *TAG = "RTSP";
 
 // RTSP Configuration
 #define RTSP_HOST       "10.0.0.1"
@@ -31,8 +32,8 @@ static const char *TAG = "RTSP_MANUAL";
 #define RTSP_URL        "rtsp://" RTSP_HOST ":" "8554" RTSP_PATH
 
 // Video configuration
-#define VIDEO_WIDTH     720
-#define VIDEO_HEIGHT    720
+#define VIDEO_WIDTH     128 // Default/fallback, not used after dynamic alloc
+#define VIDEO_HEIGHT    128
 #define DISPLAY_WIDTH   720
 #define DISPLAY_HEIGHT  720
 
@@ -45,6 +46,10 @@ static const char *TAG = "RTSP_MANUAL";
 static uint16_t *s_rgb_buffer = NULL;
 static uint16_t *s_display_buffer = NULL;
 static uint32_t s_frame_count = 0;
+
+// Track current input frame size
+static uint16_t s_input_width = 0;
+static uint16_t s_input_height = 0;
 
 // RTP receiver task handle
 static TaskHandle_t s_rtp_task_handle = NULL;
@@ -60,12 +65,26 @@ static char s_session_id[64] = {0};
 static char s_track_path[128] = {0};
 
 // RTP depacketization state
+
 static uint8_t *s_nal_buffer = NULL;
 static int s_nal_length = 0;
 static uint16_t s_last_seq = 0;
 static bool s_first_packet = true;
 static bool s_got_idr = false;  // Wait for IDR before decoding
 static bool s_skip_until_fu_start = true;  // Skip partial NAL after sync
+
+// IDR multi-slice accumulation: OBS encodes IDR frames as multiple slice NALs.
+// Feeding them one-by-one causes "primary already decoded" errors because the
+// decoder treats each IDR NAL as a new frame. Instead, accumulate all consecutive
+// IDR slices and feed them as one concatenated buffer so the decoder sees a
+// complete multi-slice access unit.
+static uint8_t *s_idr_accum_buf = NULL;
+static int      s_idr_accum_len = 0;
+static int      s_idr_slice_cnt = 0;
+
+// RTP inactivity timeout (ms)
+#define RTP_INACTIVITY_TIMEOUT 5000
+static volatile uint32_t s_last_rtp_time = 0;
 
 // Scale frame with aspect ratio preservation
 static void scale_frame_fit_height(const uint16_t *src, uint16_t *dst,
@@ -94,32 +113,81 @@ static void on_frame_decoded(uint8_t *frame_data, uint16_t width, uint16_t heigh
     if (frame_data == NULL || size == 0) {
         return;
     }
-    
-    // Use known dimensions since TinyH264 may not report them correctly
-    uint16_t w = VIDEO_WIDTH;
-    uint16_t h = VIDEO_HEIGHT;
-    
+
+    // Infer dimensions from I420 buffer size when decoder doesn't report them.
+    // esp_h264_dec_out_frame_t has no width/height fields, so h264.c passes 0,0.
+    // I420: size = W * H * 3/2  =>  W*H = size*2/3. For square frames: W=H=sqrt(W*H).
+    if (width == 0 || height == 0) {
+        uint32_t pixels = (size * 2) / 3;
+        uint16_t side = (uint16_t)sqrtf((float)pixels);
+        if (side > 0 && (uint32_t)side * side == pixels) {
+            width = height = side;
+        } else {
+            // Non-square: fall back to last known dimensions
+            width  = s_input_width  ? s_input_width  : 256;
+            height = s_input_height ? s_input_height : 256;
+        }
+    }
+
+    // Dynamic YUV buffer for decoded frame
+    static uint8_t *s_yuv_buffer = NULL;
+    static size_t s_yuv_size = 0;
+    size_t required_yuv_size = width * height * 3 / 2;
+    if (width != s_input_width || height != s_input_height || s_yuv_buffer == NULL || s_yuv_size != required_yuv_size) {
+        if (s_yuv_buffer) {
+            free(s_yuv_buffer);
+            s_yuv_buffer = NULL;
+        }
+        s_yuv_buffer = malloc(required_yuv_size);
+        s_yuv_size = required_yuv_size;
+        if (!s_yuv_buffer) {
+            ESP_LOGE(TAG, "Failed to allocate YUV buffer for %dx%d", width, height);
+            return;
+        }
+    }
+    // Use `size` (actual decoder output) not `required_yuv_size` to avoid buffer overread
+    memcpy(s_yuv_buffer, frame_data, size);
+
+    // If input resolution changed, reallocate RGB buffer and log detected resolution
+    if (width != s_input_width || height != s_input_height || s_rgb_buffer == NULL) {
+        ESP_LOGI(TAG, "Detected video resolution: %dx%d", width, height);
+        if (s_rgb_buffer) {
+            free(s_rgb_buffer);
+            s_rgb_buffer = NULL;
+        }
+        size_t rgb_size = rgb565_buffer_size(width, height);
+        s_rgb_buffer = heap_caps_aligned_calloc(64, 1, rgb_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!s_rgb_buffer) s_rgb_buffer = heap_caps_aligned_calloc(64, 1, rgb_size, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+        if (!s_rgb_buffer) {
+            ESP_LOGE(TAG, "Failed to allocate RGB buffer for %dx%d", width, height);
+            return;
+        }
+        s_input_width = width;
+        s_input_height = height;
+        ESP_LOGI(TAG, "Allocated RGB buffer for %dx%d", width, height);
+    }
+
     s_frame_count++;
-    ESP_LOGI(TAG, "Frame #%lu decoded: %dx%d (%lu bytes)", (unsigned long)s_frame_count, w, h, (unsigned long)size);
+    ESP_LOGI(TAG, "Frame #%lu decoded: %dx%d (%lu bytes)", (unsigned long)s_frame_count, width, height, (unsigned long)size);
 
     // Dump a simple checksum and a few Y values from the decoded frame
     uint32_t y_sum = 0;
-    for (int i = 0; i < w * h; i += 31) y_sum += frame_data[i];
-    ESP_LOGI(TAG, "Y plane checksum: 0x%08lx, Y[0]=%u Y[1]=%u Y[100]=%u Y[last]=%u", (unsigned long)y_sum, frame_data[0], frame_data[1], frame_data[100], frame_data[w*h-1]);
+    for (int i = 0; i < width * height; i += 31) y_sum += s_yuv_buffer[i];
+    ESP_LOGI(TAG, "Y plane checksum: 0x%08lx, Y[0]=%u Y[1]=%u Y[100]=%u Y[last]=%u", (unsigned long)y_sum, s_yuv_buffer[0], s_yuv_buffer[1], s_yuv_buffer[100], s_yuv_buffer[width*height-1]);
 
     // Convert I420 to RGB565
-    i420_to_rgb565(frame_data, s_rgb_buffer, w, h);
+    i420_to_rgb565(s_yuv_buffer, s_rgb_buffer, width, height);
 
     // Dump a simple checksum and a few RGB565 values
     uint32_t rgb_sum = 0;
-    for (int i = 0; i < w * h; i += 31) rgb_sum += s_rgb_buffer[i];
-    ESP_LOGI(TAG, "RGB565 checksum: 0x%08lx, RGB[0]=0x%04x RGB[1]=0x%04x RGB[100]=0x%04x RGB[last]=0x%04x", (unsigned long)rgb_sum, s_rgb_buffer[0], s_rgb_buffer[1], s_rgb_buffer[100], s_rgb_buffer[w*h-1]);
+    for (int i = 0; i < width * height; i += 31) rgb_sum += s_rgb_buffer[i];
+    ESP_LOGI(TAG, "RGB565 checksum: 0x%08lx, RGB[0]=0x%04x RGB[1]=0x%04x RGB[100]=0x%04x RGB[last]=0x%04x", (unsigned long)rgb_sum, s_rgb_buffer[0], s_rgb_buffer[1], s_rgb_buffer[100], s_rgb_buffer[width*height-1]);
 
     // Draw to display
-    if (VIDEO_WIDTH == DISPLAY_WIDTH && VIDEO_HEIGHT == DISPLAY_HEIGHT) {
+    if (width == DISPLAY_WIDTH && height == DISPLAY_HEIGHT) {
         esp_lcd_panel_draw_bitmap(get_panel_handle(), 0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT, s_rgb_buffer);
     } else {
-        scale_frame_fit_height(s_rgb_buffer, s_display_buffer, VIDEO_WIDTH, VIDEO_HEIGHT, DISPLAY_WIDTH, DISPLAY_HEIGHT);
+        scale_frame_fit_height(s_rgb_buffer, s_display_buffer, width, height, DISPLAY_WIDTH, DISPLAY_HEIGHT);
         esp_lcd_panel_draw_bitmap(get_panel_handle(), 0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT, s_display_buffer);
     }
     display_wait_refresh_done();
@@ -401,14 +469,17 @@ static int rtp_setup(void)
     }
     
     // Increase receive buffer to reduce packet loss
-    int rcvbuf = 128 * 1024;  // 128KB
-    setsockopt(s_rtp_sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
-    
+    int rcvbuf = 256 * 1024;  // 256KB
+    int ret = setsockopt(s_rtp_sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+    if (ret < 0) {
+        ESP_LOGW(TAG, "setsockopt SO_RCVBUF failed: errno=%d", errno);
+    }
+
     // Check actual buffer size
     int actual_buf = 0;
     socklen_t optlen = sizeof(actual_buf);
     getsockopt(s_rtp_sock, SOL_SOCKET, SO_RCVBUF, &actual_buf, &optlen);
-    ESP_LOGI(TAG, "RTP socket receive buffer: %d bytes", actual_buf);
+    ESP_LOGI(TAG, "RTP socket receive buffer requested: %d bytes, actual: %d bytes", rcvbuf, actual_buf);
     
     if (bind(s_rtp_sock, (struct sockaddr *)&rtp_addr, sizeof(rtp_addr)) < 0) {
         ESP_LOGE(TAG, "Failed to bind RTP socket");
@@ -490,8 +561,8 @@ static void feed_nal_to_decoder(uint8_t *nal, int len)
     const char *name = (nal_type <= 31) ? nal_names[nal_type] : "other";
     ESP_LOGI(TAG, "NAL #%d: type=%d (%s), len=%d", nal_count, nal_type, name, len);
 
-    // Filter out tiny NALs (likely filler or invalid)
-    if (len < 32 && (nal_type == 1 || nal_type == 5)) {
+    // Filter out truly malformed NALs (minimum slice header is ~4 bytes)
+    if (len < 4 && (nal_type == 1 || nal_type == 5)) {
         ESP_LOGW(TAG, "SKIP: NAL #%d type=%d (%s) len=%d too small to be valid slice", nal_count, nal_type, name, len);
         return;
     }
@@ -505,6 +576,11 @@ static void feed_nal_to_decoder(uint8_t *nal, int len)
     }
     if (nal_type == 7 || nal_type == 8) {
         sps_pps_fed = true;
+        if (nal_type == 7) {
+            // New SPS = new GOP - reset any leftover IDR accumulation
+            s_idr_accum_len = 0;
+            s_idr_slice_cnt = 0;
+        }
     }
 
     // Only allow decoding after first IDR
@@ -549,6 +625,36 @@ static void feed_nal_to_decoder(uint8_t *nal, int len)
         }
     }
 
+    // IDR slice: accumulate all slices of this keyframe into one buffer.
+    // They will be fed to the decoder together when the first P-slice arrives.
+    if (nal_type == 5) {
+        if (!s_idr_accum_buf) {
+            s_idr_accum_buf = heap_caps_malloc(NAL_BUFFER_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            if (!s_idr_accum_buf) s_idr_accum_buf = malloc(NAL_BUFFER_SIZE);
+        }
+        if (s_idr_accum_buf && s_idr_accum_len + len + 4 <= NAL_BUFFER_SIZE) {
+            uint8_t *p = s_idr_accum_buf + s_idr_accum_len;
+            p[0] = 0; p[1] = 0; p[2] = 0; p[3] = 1;
+            memcpy(p + 4, nal, len);
+            s_idr_accum_len += len + 4;
+            s_idr_slice_cnt++;
+            ESP_LOGI(TAG, "IDR accum: slice %d len=%d buf_total=%d", s_idr_slice_cnt, len, s_idr_accum_len);
+        } else {
+            ESP_LOGE(TAG, "IDR accum buffer full/NULL, dropping slice");
+        }
+        return;  // Do not feed to decoder yet
+    }
+
+    // P-slice: flush all buffered IDR slices first so the decoder sees a
+    // complete multi-slice IDR access unit before the first inter-frame.
+    if (nal_type == 1 && s_idr_accum_len > 0 && s_idr_accum_buf) {
+        ESP_LOGI(TAG, "Flushing %d IDR slices (%d bytes) to decoder", s_idr_slice_cnt, s_idr_accum_len);
+        esp_err_t idr_ret = h264_decoder_decode(s_idr_accum_buf, s_idr_accum_len);
+        ESP_LOGI(TAG, "IDR flush result: %d (0=OK)", idr_ret);
+        s_idr_accum_len = 0;
+        s_idr_slice_cnt = 0;
+    }
+
     // Add start code and decode
     static uint8_t nal_with_start[NAL_BUFFER_SIZE + 4];
     nal_with_start[0] = 0;
@@ -559,10 +665,7 @@ static void feed_nal_to_decoder(uint8_t *nal, int len)
 
     esp_err_t ret = h264_decoder_decode(nal_with_start, len + 4);
     ESP_LOGI(TAG, "h264_decoder_decode() returned %d for NAL type %d, len %d", ret, nal_type, len);
-    if (nal_type == 5) {
-        ESP_LOGI(TAG, "IDR decode result: %d (0=OK)", ret);
-    }
-    if (ret != ESP_OK && (nal_type == 5 || nal_type == 7 || nal_type == 8)) {
+    if (ret != ESP_OK && (nal_type == 7 || nal_type == 8)) {
         ESP_LOGE(TAG, "Decoder returned error %d for NAL type %d", ret, nal_type);
     }
 }
@@ -575,6 +678,8 @@ static void process_rtp_packet(uint8_t *data, int len)
     uint8_t cc = data[0] & 0x0F;
     uint16_t seq = (data[2] << 8) | data[3];
     if (len < 12) return;  // RTP header is 12 bytes minimum
+    // Update last RTP time for inactivity timeout
+    s_last_rtp_time = esp_log_timestamp();
 
     uint8_t version = (data[0] >> 6) & 0x03;
     if (version != 2) {
@@ -878,18 +983,11 @@ void app_main(void)
     init_display();
     
     // Allocate buffers
-    size_t rgb_size = rgb565_buffer_size(VIDEO_WIDTH, VIDEO_HEIGHT);
-    s_rgb_buffer = heap_caps_aligned_calloc(64, 1, rgb_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!s_rgb_buffer) s_rgb_buffer = heap_caps_aligned_calloc(64, 1, rgb_size, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
-    if (!s_rgb_buffer) {
-        ESP_LOGE(TAG, "Failed to allocate RGB buffer");
-        return;
-    }
-    
+    // Only allocate display buffer and NAL buffer here; RGB buffer is dynamic
     size_t display_size = rgb565_buffer_size(DISPLAY_WIDTH, DISPLAY_HEIGHT);
     s_display_buffer = heap_caps_aligned_calloc(64, 1, display_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!s_display_buffer) s_display_buffer = heap_caps_aligned_calloc(64, 1, display_size, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
-    
+
     // Allocate NAL reassembly buffer
     s_nal_buffer = heap_caps_malloc(NAL_BUFFER_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!s_nal_buffer) s_nal_buffer = heap_caps_malloc(NAL_BUFFER_SIZE, MALLOC_CAP_8BIT);
@@ -897,8 +995,8 @@ void app_main(void)
         ESP_LOGE(TAG, "Failed to allocate NAL buffer");
         return;
     }
-    
-    ESP_LOGI(TAG, "Buffers allocated");
+
+    ESP_LOGI(TAG, "Buffers allocated (display: %dx%d)", DISPLAY_WIDTH, DISPLAY_HEIGHT);
     
     // Initialize H.264 decoder
     h264_decoder_config_t h264_cfg = {
@@ -934,16 +1032,33 @@ void app_main(void)
     
     // Start RTP receiver task
     s_rtp_task_exit = false;
-    xTaskCreatePinnedToCore(rtp_receiver_task, "rtp_rx", 8192, NULL, 5, &s_rtp_task_handle, 1);
+    s_last_rtp_time = esp_log_timestamp();
+    xTaskCreatePinnedToCore(rtp_receiver_task, "rtp_rx", 8192, NULL, 8, &s_rtp_task_handle, 1);
 
     // Main loop - monitor status and handle reconnection
+    uint32_t last_keepalive = 0;
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(5000));
+        vTaskDelay(pdMS_TO_TICKS(1000));
         ESP_LOGI(TAG, "Frames decoded: %lu", (unsigned long)s_frame_count);
 
-        // Check if TCP receiver task has exited (connection lost)
+        // Send RTSP keepalive (OPTIONS) every 20 seconds
+        uint32_t now = esp_log_timestamp();
+        if (now - last_keepalive > 20000 && s_rtsp_sock >= 0) {
+            rtsp_request("OPTIONS", RTSP_URL, NULL, s_rtsp_response, sizeof(s_rtsp_response));
+            last_keepalive = now;
+        }
+
+        // Check for RTP inactivity timeout or TCP receiver task exit
+        bool reconnect_needed = false;
         if (s_rtsp_sock < 0) {
             ESP_LOGW(TAG, "RTSP socket closed, attempting to reconnect...");
+            reconnect_needed = true;
+        } else if ((now - s_last_rtp_time) > RTP_INACTIVITY_TIMEOUT) {
+            ESP_LOGW(TAG, "RTP inactivity timeout (no packets for %d ms), reconnecting...", RTP_INACTIVITY_TIMEOUT);
+            reconnect_needed = true;
+        }
+
+        if (reconnect_needed) {
             // Clean up decoder and buffers if needed
             h264_decoder_deinit();
             // Signal previous RTP receiver task to exit if running
@@ -995,6 +1110,7 @@ void app_main(void)
             feed_sps_pps_to_decoder();
             // Restart RTP receiver task
             s_rtp_task_exit = false;
+            s_last_rtp_time = esp_log_timestamp();
             xTaskCreatePinnedToCore(rtp_receiver_task, "rtp_rx", 8192, NULL, 5, &s_rtp_task_handle, 1);
             ESP_LOGI(TAG, "RTSP reconnection complete.");
         }

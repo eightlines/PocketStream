@@ -15,6 +15,12 @@
 
 # Log files
 *.log
+log.*.txt
+
+# Binary media captures (too large for git)
+commands/*.avi
+commands/*.h264
+commands/*.mp4
 
 # Build artifacts and directories
 **/build/

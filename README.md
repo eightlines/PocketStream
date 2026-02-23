@@ -51,7 +51,7 @@ After changing x264 options: Stop then Start the RTSP plugin for settings to tak
 │   └── main.c
 ├── commands
 │   ├── stream_rtsp_testpattern_esp32_720.ps1
-│   ├── stream_rtsp_testpattern_esp32_720.ps1
+│   ├── transcode_obs_relay.ps1
 └── README.md
 ```
 

@@ -27,7 +27,7 @@ static const char *TAG = "RTSP";
 
 // RTSP Configuration
 #define RTSP_HOST       "10.0.0.1"
-#define RTSP_PORT       8554
+#define RTSP_PORT       8554   // TD direct (LIVE555 v2014); change to 8555 for FFmpeg relay
 #define RTSP_PATH       "/live"
 #define RTSP_URL        "rtsp://" RTSP_HOST ":" "8554" RTSP_PATH
 
@@ -81,8 +81,29 @@ static bool s_skip_until_fu_start = true;  // Skip partial NAL after sync
 static uint8_t *s_idr_accum_buf = NULL;
 static int      s_idr_accum_len = 0;
 static int      s_idr_slice_cnt = 0;
+// Timestamp of last accumulated IDR slice — used to detect when a new IDR
+// frame starts vs. a continuation slice of the current frame (>200 ms gap
+// means new frame, so the buffer is reset before appending).
+static uint32_t s_idr_last_ms = 0;
+// True once the current decoder instance has been given a complete IDR.
+// Reset to false every time the decoder is re-initialized (on reconnect).
+// P-slices are skipped until this becomes true.
+static bool     s_decoder_has_idr = false;
 
-// RTP inactivity timeout (ms)
+// LIVE555 v2014 sends RTP interleaved data *before* the PLAY 200 OK on the TCP
+// connection.  rtsp_request() stashes ALL bytes it receives with the PLAY
+// response here.  buffered_read_exact() drains this buffer before reading from
+// the socket, so the RTP receiver sees a clean byte stream regardless of how
+// many payload bytes arrived together with the interleaved header.
+static uint8_t s_play_buf[2048];
+static int     s_play_buf_len    = 0;  // valid bytes in s_play_buf
+static int     s_play_buf_offset = 0;  // next byte to consume
+
+// RTP inactivity timeout (ms). Must be long enough to span the GOP interval
+// (keyframe period) so we don't reconnect before the first IDR arrives.
+// TD/LIVE555 keyframe interval is unknown — 30s if conservative, 5s is a
+// reasonable default.  Adjust upward if the stream consistently sends an IDR
+// later than this (set to at least keyframe_interval + 2s).
 #define RTP_INACTIVITY_TIMEOUT 5000
 static volatile uint32_t s_last_rtp_time = 0;
 
@@ -234,13 +255,29 @@ static int rtsp_request(const char *method, const char *uri, const char *extra_h
     }
     response[received] = '\0';
     
-    // Check if we got interleaved data instead of RTSP response
-    // This can happen after PLAY when server starts streaming immediately
+    // LIVE555 v2014 sends the first RTP interleaved frame header on the TCP
+    // connection before the PLAY 200 OK response.  Save those 4 bytes so the
+    // RTP receiver task can read the first frame's payload cleanly.  After the
+    // receiver reads that payload via tcp_read_exact(), the PLAY 200 OK text
+    // will be next in the stream; the byte scanner in read_interleaved_rtp()
+    // handles non-'$' bytes by skipping them, so it will resync on the next
+    // real interleaved frame without any special treatment here.
     if (response[0] == '$') {
-        ESP_LOGI(TAG, "RX: Interleaved data started (streaming began!) - %d bytes", received);
-        // Note: This data is lost but the receiver will pick up the next packets
-        // We could buffer it but it adds complexity. Just let it resync.
-        return received;  // Return positive to indicate success
+        // LIVE555 v2014: RTP interleaved data arrived before PLAY 200 OK.
+        // Save ALL received bytes so buffered_read_exact() can replay them.
+        // The recv() above may have returned the 4-byte interleaved header plus
+        // some or all of the first RTP payload in one TCP segment — saving only
+        // 4 bytes would silently discard the payload and desync the stream.
+        int save = (received <= (int)sizeof(s_play_buf)) ? received : (int)sizeof(s_play_buf);
+        memcpy(s_play_buf, response, save);
+        s_play_buf_len    = save;
+        s_play_buf_offset = 0;
+        ESP_LOGI(TAG, "RX: RTP before PLAY 200 OK — saved %d bytes "
+                      "(hdr: %02X %02X %02X %02X)",
+                 save,
+                 (uint8_t)response[0], (uint8_t)response[1],
+                 (uint8_t)response[2], (uint8_t)response[3]);
+        return received;
     }
     
     ESP_LOGI(TAG, "RX:\n%s", response);
@@ -525,10 +562,13 @@ static int rtsp_handshake(void)
     // Build track URI
     snprintf(uri, sizeof(s_rtsp_uri), "%s/%s", RTSP_URL, s_track_path);
     
-    // SETUP with TCP interleaved transport (no UDP packet loss!)
-    char transport[128];
-    snprintf(transport, sizeof(transport), "Transport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n");
-    
+    // SETUP with TCP interleaved transport.
+    // RTP/RTCP are multiplexed over the existing RTSP TCP connection on
+    // channels 0 and 1, framed as  $ <ch> <len_hi> <len_lo> <data>.
+    // This eliminates the UDP packet loss that prevented IDR frames from
+    // ever being fully assembled.
+    const char *transport = "Transport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n";
+
     if (rtsp_request("SETUP", uri, transport, response, sizeof(s_rtsp_response)) < 0) {
         return -1;
     }
@@ -556,10 +596,8 @@ static void feed_nal_to_decoder(uint8_t *nal, int len)
 
 
 
-    // Log all NAL types and lengths
     const char *nal_names[] = {"?", "slice", "DPA", "DPB", "DPC", "IDR", "SEI", "SPS", "PPS", "AUD", "EOSEQ", "EOSTREAM", "FILL", "13", "14", "15", "16", "17", "18", "19", "20", "21", "22", "23", "24", "25", "26", "27", "28", "29", "30", "31"};
     const char *name = (nal_type <= 31) ? nal_names[nal_type] : "other";
-    ESP_LOGI(TAG, "NAL #%d: type=%d (%s), len=%d", nal_count, nal_type, name, len);
 
     // Filter out truly malformed NALs (minimum slice header is ~4 bytes)
     if (len < 4 && (nal_type == 1 || nal_type == 5)) {
@@ -593,9 +631,6 @@ static void feed_nal_to_decoder(uint8_t *nal, int len)
         return;
     }
 
-    ESP_LOGI(TAG, "FEED_NAL: #%d type=%d len=%d first8=%02X %02X %02X %02X %02X %02X %02X %02X", nal_count, nal_type, len,
-        nal[0], len>1?nal[1]:0, len>2?nal[2]:0, len>3?nal[3]:0, len>4?nal[4]:0, len>5?nal[5]:0, len>6?nal[6]:0, len>7?nal[7]:0);
-
     // Track IDR reception
     if (nal_type == 5 && !s_got_idr) {
         ESP_LOGI(TAG, "First IDR received!");
@@ -611,27 +646,24 @@ static void feed_nal_to_decoder(uint8_t *nal, int len)
         return;
     }
 
-    // Log NAL info periodically or for important types
-    if (nal_type == 7 || nal_type == 8 || nal_type == 5 || nal_type == 1 || nal_count % 50 == 1) {
-        const char *nal_names[] = {"?", "slice", "DPA", "DPB", "DPC", "IDR", "SEI", "SPS", "PPS"};
-        const char *name = (nal_type <= 8) ? nal_names[nal_type] : "other";
-        ESP_LOGI(TAG, "NAL #%d: type=%d (%s), len=%d", nal_count, nal_type, name, len);
-        // Dump first 16 bytes of raw NAL for type 1 and 5
-        if ((nal_type == 1 || nal_type == 5) && len >= 16) {
-            ESP_LOGI(TAG, "NAL #%d: type=%d first16: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
-                nal_count, nal_type,
-                nal[0], nal[1], nal[2], nal[3], nal[4], nal[5], nal[6], nal[7],
-                nal[8], nal[9], nal[10], nal[11], nal[12], nal[13], nal[14], nal[15]);
-        }
-    }
-
     // IDR slice: accumulate all slices of this keyframe into one buffer.
     // They will be fed to the decoder together when the first P-slice arrives.
+    // The buffer is preserved across reconnects so that a P-slice received in
+    // a later session can still use a recently-accumulated IDR.
     if (nal_type == 5) {
         if (!s_idr_accum_buf) {
             s_idr_accum_buf = heap_caps_malloc(NAL_BUFFER_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
             if (!s_idr_accum_buf) s_idr_accum_buf = malloc(NAL_BUFFER_SIZE);
         }
+        // Detect a new IDR frame: consecutive slices of the same frame arrive
+        // within ~10 ms of each other; anything beyond 200 ms is a new frame.
+        uint32_t now_ms = esp_log_timestamp();
+        if (s_idr_accum_len > 0 && (now_ms - s_idr_last_ms) > 200) {
+            ESP_LOGI(TAG, "New IDR frame detected — clearing old accum (%d bytes, %d slices)", s_idr_accum_len, s_idr_slice_cnt);
+            s_idr_accum_len = 0;
+            s_idr_slice_cnt = 0;
+        }
+        s_idr_last_ms = now_ms;
         if (s_idr_accum_buf && s_idr_accum_len + len + 4 <= NAL_BUFFER_SIZE) {
             uint8_t *p = s_idr_accum_buf + s_idr_accum_len;
             p[0] = 0; p[1] = 0; p[2] = 0; p[3] = 1;
@@ -647,12 +679,30 @@ static void feed_nal_to_decoder(uint8_t *nal, int len)
 
     // P-slice: flush all buffered IDR slices first so the decoder sees a
     // complete multi-slice IDR access unit before the first inter-frame.
+    // The IDR buffer may have been accumulated in a previous RTSP session
+    // (it is intentionally preserved across reconnects).
     if (nal_type == 1 && s_idr_accum_len > 0 && s_idr_accum_buf) {
         ESP_LOGI(TAG, "Flushing %d IDR slices (%d bytes) to decoder", s_idr_slice_cnt, s_idr_accum_len);
         esp_err_t idr_ret = h264_decoder_decode(s_idr_accum_buf, s_idr_accum_len);
         ESP_LOGI(TAG, "IDR flush result: %d (0=OK)", idr_ret);
         s_idr_accum_len = 0;
         s_idr_slice_cnt = 0;
+        if (idr_ret == ESP_OK) {
+            s_decoder_has_idr = true;
+        }
+    }
+
+    // Do not decode a P-slice until the current decoder instance has a valid
+    // IDR reference frame. Without this guard, P-slices decoded after a
+    // reconnect (where decoder was re-initialized) produce no output because
+    // TinyH264 has no reference frame yet.
+    if (nal_type == 1 && !s_decoder_has_idr) {
+        static int s_no_idr_skip = 0;
+        s_no_idr_skip++;
+        if (s_no_idr_skip % 50 == 1) {
+            ESP_LOGW(TAG, "SKIP P-slice: no IDR reference in current decoder (skipped %d)", s_no_idr_skip);
+        }
+        return;
     }
 
     // Add start code and decode
@@ -664,7 +714,6 @@ static void feed_nal_to_decoder(uint8_t *nal, int len)
     memcpy(nal_with_start + 4, nal, len);
 
     esp_err_t ret = h264_decoder_decode(nal_with_start, len + 4);
-    ESP_LOGI(TAG, "h264_decoder_decode() returned %d for NAL type %d, len %d", ret, nal_type, len);
     if (ret != ESP_OK && (nal_type == 7 || nal_type == 8)) {
         ESP_LOGE(TAG, "Decoder returned error %d for NAL type %d", ret, nal_type);
     }
@@ -698,6 +747,12 @@ static void process_rtp_packet(uint8_t *data, int len)
     uint8_t *payload = data + header_len;
     int payload_len = len - header_len;
 
+    // RTP Marker bit (data[1] bit 7): marks the last RTP packet of each access unit.
+    // RFC 6184: for FU-A, M=1 coincides with E=1 in a well-behaved encoder.
+    // LIVE555 v2014 sets M=1 on the last FU-A fragment but does NOT reliably set E=1
+    // in the FU header — so we use M as the chain-completion trigger.
+    uint8_t m_bit = (data[1] >> 7) & 0x01;
+
     // Check for sequence number gaps (track but don't spam logs)
     static int total_gaps = 0;
     static int total_lost = 0;
@@ -730,19 +785,15 @@ static void process_rtp_packet(uint8_t *data, int len)
 
     if (nal_type >= 1 && nal_type <= 23) {
         // Single NAL unit - feed directly
-        ESP_LOGI(TAG, "RTP NAL: type=%d len=%d", nal_type, payload_len);
         feed_nal_to_decoder(payload, payload_len);
     }
     else if (nal_type == 24) {
         // STAP-A - Single-Time Aggregation Packet
-        ESP_LOGI(TAG, "STAP-A packet, len=%d", payload_len);
         int offset = 1;  // Skip STAP-A header
         while (offset + 2 < payload_len) {
             uint16_t nal_size = (payload[offset] << 8) | payload[offset + 1];
             offset += 2;
             if (offset + nal_size <= payload_len) {
-                uint8_t stap_nal_type = payload[offset] & 0x1F;
-                ESP_LOGI(TAG, "STAP-A NAL: type=%d len=%d", stap_nal_type, nal_size);
                 feed_nal_to_decoder(payload + offset, nal_size);
                 offset += nal_size;
             } else {
@@ -762,20 +813,25 @@ static void process_rtp_packet(uint8_t *data, int len)
         static int fua_count = 0;
         static int fua_start_count = 0;
         static int fua_end_count = 0;
+        static int fua_mbit_count = 0;
         fua_count++;
         if (start_bit) fua_start_count++;
         if (end_bit) fua_end_count++;
+        if (m_bit) fua_mbit_count++;
 
-        // Log every 100 packets with summary
-        if (fua_count % 100 == 1) {
-            ESP_LOGI(TAG, "FU-A summary: total=%d start=%d end=%d", fua_count, fua_start_count, fua_end_count);
-        }
-
+        // Log chain starts and ends always; periodic summary every 100 packets.
+        // Per-packet logging (even for first N packets) saturates UART at
+        // 115200 baud (~8.7 ms/line), causing TCP receive-window backpressure
+        // that stalls LIVE555 and makes the stream appear to stop.
         if (start_bit) {
-            ESP_LOGI(TAG, "FU-A START: type=%d", real_nal_type);
-        }
-        if (end_bit) {
-            ESP_LOGI(TAG, "FU-A END: type=%d", real_nal_type);
+            ESP_LOGI(TAG, "FU-A chain start #%d: type=%d len=%d",
+                     fua_start_count, real_nal_type, payload_len);
+        } else if (end_bit || m_bit) {
+            ESP_LOGI(TAG, "FU-A chain end: count=%d type=%d E=%d M=%d total_nal=%d",
+                     fua_count, real_nal_type, end_bit, m_bit, s_nal_length);
+        } else if (fua_count % 100 == 0) {
+            ESP_LOGI(TAG, "FU-A summary: total=%d start=%d end=%d mbit=%d",
+                     fua_count, fua_start_count, fua_end_count, fua_mbit_count);
         }
 
         // Skip until we see a fresh start (handles sync mid-NAL)
@@ -784,8 +840,17 @@ static void process_rtp_packet(uint8_t *data, int len)
         }
 
         if (start_bit) {
+            // LIVE555 v2014 sets neither E bit nor M bit on the last FU-A fragment.
+            // When the next chain's start arrives, treat it as the implicit end of
+            // the previous chain — feed whatever was assembled so far.
+            if (s_nal_length > 0) {
+                uint8_t prev_type = s_nal_buffer[0] & 0x1F;
+                ESP_LOGI(TAG, "FU-A implicit end: prev_type=%d len=%d, next_type=%d", prev_type, s_nal_length, real_nal_type);
+                feed_nal_to_decoder(s_nal_buffer, s_nal_length);
+                s_nal_length = 0;
+            }
             // First fragment - start new NAL
-            s_skip_until_fu_start = false;  // Found a clean start
+            s_skip_until_fu_start = false;
             s_nal_length = 0;
             // Reconstruct NAL header
             s_nal_buffer[0] = (payload[0] & 0xE0) | real_nal_type;
@@ -798,11 +863,11 @@ static void process_rtp_packet(uint8_t *data, int len)
             s_nal_length += payload_len - 2;
         }
 
-        if (end_bit) {
-            ESP_LOGI(TAG, "FU-A END received: type=%d, nal_len=%d", real_nal_type, s_nal_length);
+        // Complete the NAL on E bit (RFC 6184) or M bit (LIVE555 v2014 workaround).
+        // LIVE555 v2014 sets M=1 on last fragment but often omits E=1 in FU header.
+        if (end_bit || m_bit) {
             if (s_nal_length > 0) {
-                // Last fragment - feed complete NAL
-                ESP_LOGI(TAG, "FU-A complete: type=%d, total_len=%d", real_nal_type, s_nal_length);
+                ESP_LOGI(TAG, "FU-A complete: type=%d, total_len=%d (E=%d M=%d)", real_nal_type, s_nal_length, end_bit, m_bit);
                 feed_nal_to_decoder(s_nal_buffer, s_nal_length);
                 s_nal_length = 0;
             }
@@ -813,153 +878,138 @@ static void process_rtp_packet(uint8_t *data, int len)
     }
 }
 
-// Read exact number of bytes from TCP socket
+// Read exactly `len` bytes from a TCP socket, retrying on EAGAIN.
+// Returns `len` on success, 0 on connection close, -1 on error.
+// Checks s_rtp_task_exit on each EAGAIN so the task can be stopped.
 static int tcp_read_exact(int sock, uint8_t *buf, int len)
 {
     int total = 0;
     while (total < len) {
+        if (s_rtp_task_exit) return -1;
         int n = recv(sock, buf + total, len - total, 0);
-        if (n <= 0) return n;
+        if (n > 0) { total += n; continue; }
+        if (n == 0) return 0;  // Connection closed
+        if (errno == EAGAIN || errno == EWOULDBLOCK) continue;  // Timeout, retry
+        return -1;  // Real socket error
+    }
+    return total;
+}
+
+// Read `len` bytes, draining s_play_buf (pre-received PLAY-response data) first,
+// then continuing from the socket.  This ensures any payload bytes that arrived
+// in the same TCP segment as the PLAY response are not silently discarded.
+static int buffered_read_exact(int sock, uint8_t *buf, int len)
+{
+    int total = 0;
+    // 1. Drain pre-buffered bytes.
+    if (s_play_buf_offset < s_play_buf_len) {
+        int avail = s_play_buf_len - s_play_buf_offset;
+        int take  = (avail < len) ? avail : len;
+        memcpy(buf, s_play_buf + s_play_buf_offset, take);
+        s_play_buf_offset += take;
+        total += take;
+    }
+    // 2. Read the rest from the socket.
+    if (total < len) {
+        int n = tcp_read_exact(sock, buf + total, len - total);
+        if (n <= 0) return n;  // closed or error
         total += n;
     }
     return total;
 }
 
+// Read one complete RTP packet from the RTSP TCP connection using the
+// RTSP interleaved binary framing (RFC 2326 §10.12):
+//   $ <1-byte channel> <2-byte big-endian length> <RTP or RTCP data>
+// Returns the RTP payload length (>0), 0 for RTCP/skip, or -1 on error.
+static int read_interleaved_rtp(uint8_t *buf, int buf_size)
+{
+    uint8_t hdr[4];
+
+    // Scan for the '$' (0x24) interleaved-frame magic byte.
+    // Non-'$' bytes may be PLAY 200 OK text or RTSP keepalive responses —
+    // skip them.  buffered_read_exact() drains any bytes pre-received with
+    // the PLAY response before reading from the socket.
+    int skip_count = 0;
+    while (true) {
+        if (buffered_read_exact(s_rtsp_sock, hdr, 1) <= 0) {
+            if (skip_count > 0)
+                ESP_LOGI(TAG, "Byte scanner: read error after skipping %d bytes", skip_count);
+            return -1;
+        }
+        if (hdr[0] == '$') break;
+        skip_count++;
+        if (skip_count == 1 || skip_count % 200 == 0) {
+            ESP_LOGI(TAG, "Byte scanner: skip #%d byte=0x%02X '%c'",
+                     skip_count, hdr[0], (hdr[0] >= 32 && hdr[0] < 127) ? hdr[0] : '.');
+        }
+    }
+    if (skip_count > 0) {
+        ESP_LOGI(TAG, "Byte scanner: found '$' after %d skipped bytes", skip_count);
+    }
+
+    if (buffered_read_exact(s_rtsp_sock, hdr + 1, 3) <= 0) return -1;
+
+    uint8_t  channel = hdr[1];
+    uint16_t length  = ((uint16_t)hdr[2] << 8) | hdr[3];
+
+    if (length == 0) return 0;
+
+    if (length > buf_size) {
+        // Frame too large for our buffer — discard it.
+        ESP_LOGW(TAG, "Interleaved frame too large: %u bytes (ch %u)", length, channel);
+        uint8_t discard[64];
+        uint16_t rem = length;
+        while (rem > 0) {
+            int chunk = rem < (uint16_t)sizeof(discard) ? rem : sizeof(discard);
+            if (buffered_read_exact(s_rtsp_sock, discard, chunk) <= 0) return -1;
+            rem -= chunk;
+        }
+        return 0;
+    }
+
+    if (buffered_read_exact(s_rtsp_sock, buf, length) <= 0) return -1;
+
+    // Channel 0 = RTP video, channel 1 = RTCP — we only process RTP.
+    if (channel != 0) {
+        ESP_LOGI(TAG, "RTCP packet: ch=%u len=%u (discarded)", channel, length);
+        return 0;
+    }
+    return length;
+}
+
 // TCP interleaved RTP receiver task
-// Reads RTP packets from RTSP TCP connection (interleaved mode)
 static void rtp_receiver_task(void *arg)
 {
     uint8_t *buffer = heap_caps_malloc(RTP_BUFFER_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!buffer) {
-        buffer = heap_caps_malloc(RTP_BUFFER_SIZE, MALLOC_CAP_8BIT);
-    }
+    if (!buffer) buffer = heap_caps_malloc(RTP_BUFFER_SIZE, MALLOC_CAP_8BIT);
     if (!buffer) {
         ESP_LOGE(TAG, "Failed to allocate RTP buffer");
         vTaskDelete(NULL);
         return;
     }
-    
+
     ESP_LOGI(TAG, "TCP interleaved RTP receiver started");
 
-    // Set socket to blocking with longer timeout
-    struct timeval tv = { .tv_sec = 30, .tv_usec = 0 };
-    setsockopt(s_rtsp_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
     int packet_count = 0;
-    uint8_t header[4];
-    int n;
-
-    // First, sync to '$' marker (may have lost bytes from PLAY response)
-    ESP_LOGI(TAG, "Syncing to interleaved frames...");
-    uint8_t sync_byte;
-    int sync_count = 0;
-    while (sync_count < 10000 && !s_rtp_task_exit) {
-        n = recv(s_rtsp_sock, &sync_byte, 1, 0);
-        if (n <= 0) {
-            ESP_LOGE(TAG, "Sync failed: read error");
-            free(buffer);
-            s_rtp_task_handle = NULL;
-            vTaskDelete(NULL);
-            return;
-        }
-        sync_count++;
-        if (sync_byte == '$') {
-            ESP_LOGI(TAG, "Synced after %d bytes", sync_count);
-            header[0] = '$';
-            // Read rest of header
-            n = tcp_read_exact(s_rtsp_sock, header + 1, 3);
-            if (n != 3) {
-                ESP_LOGE(TAG, "Failed to read header");
-                continue;
-            }
-            break;
-        }
-    }
-
     while (!s_rtp_task_exit) {
-        // We have header[0..3] = $ + channel + length
-        uint8_t channel = header[1];
-        uint16_t length = (header[2] << 8) | header[3];
-        
-        if (length > RTP_BUFFER_SIZE) {
-            ESP_LOGE(TAG, "Interleaved packet too large: %d", length);
-            // Try to resync
-            goto resync;
-        }
-        
-        // Read RTP packet data
-        n = tcp_read_exact(s_rtsp_sock, buffer, length);
+        int n = read_interleaved_rtp(buffer, RTP_BUFFER_SIZE);
         if (s_rtp_task_exit) break;
-        if (n != length) {
-            ESP_LOGE(TAG, "Failed to read interleaved data");
+        if (n < 0) {
+            ESP_LOGE(TAG, "TCP recv error: errno=%d", errno);
             break;
         }
-        
-        // Channel 0 = RTP, Channel 1 = RTCP
-        if (channel == 0) {
-            packet_count++;
-            if (packet_count % 100 == 1) {
-                ESP_LOGI(TAG, "TCP RTP packets: %d (len=%d)", packet_count, length);
-            }
-            process_rtp_packet(buffer, length);
-        } else if (channel == 1) {
-            // Log RTCP packets
-            static int rtcp_count = 0;
-            rtcp_count++;
-            if (rtcp_count % 10 == 1) {
-                ESP_LOGI(TAG, "RTCP packet #%d (len=%d)", rtcp_count, length);
-            }
+        if (n == 0) continue;  // RTCP or skipped frame
+
+        packet_count++;
+        if (packet_count <= 50 || packet_count % 100 == 0) {
+            ESP_LOGI(TAG, "TCP RTP packets: %d (len=%d)", packet_count, n);
         }
-        
-        // Read next header
-        n = tcp_read_exact(s_rtsp_sock, header, 4);
-        if (s_rtp_task_exit) break;
-        if (n != 4) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                ESP_LOGW(TAG, "TCP receive timeout - no data for 10s");
-                // Try to recover by waiting for more data
-                n = tcp_read_exact(s_rtsp_sock, header, 4);
-                if (s_rtp_task_exit) break;
-                if (n != 4) {
-                    ESP_LOGE(TAG, "Second timeout - connection dead");
-                    break;
-                }
-            } else {
-                ESP_LOGE(TAG, "TCP read error: %d", errno);
-                break;
-            }
-        }
-        
-        // Check for '$' interleaved marker
-        if (header[0] != '$') {
-resync:
-            ESP_LOGW(TAG, "Lost sync, resyncing... (got 0x%02X)", header[0]);
-            // Reset NAL state - next NAL might be partial
-            s_nal_length = 0;
-            s_skip_until_fu_start = true;
-            // Scan for next '$'
-            while (!s_rtp_task_exit) {
-                n = recv(s_rtsp_sock, &sync_byte, 1, 0);
-                if (s_rtp_task_exit) break;
-                if (n <= 0) break;
-                if (sync_byte == '$') {
-                    header[0] = '$';
-                    n = tcp_read_exact(s_rtsp_sock, header + 1, 3);
-                    if (s_rtp_task_exit) break;
-                    if (n == 3) break;
-                }
-            }
-        }
+        process_rtp_packet(buffer, n);
     }
-    
+
     free(buffer);
-    ESP_LOGE(TAG, "TCP receiver exited");
-    // Always close RTSP socket if not already closed
-    if (s_rtsp_sock >= 0) {
-        close(s_rtsp_sock);
-        s_rtsp_sock = -1;
-    }
-    // Clear task handle before deleting
+    ESP_LOGI(TAG, "TCP receiver exited");
     s_rtp_task_handle = NULL;
     vTaskDelete(NULL);
 }
@@ -1016,39 +1066,37 @@ void app_main(void)
     ESP_LOGI(TAG, "URL: %s", RTSP_URL);
     ESP_LOGI(TAG, "===========================================");
     
+    // Clear pre-buffer BEFORE handshake so rtsp_request() can populate it from
+    // the PLAY response.  If cleared after, the saved bytes are thrown away and
+    // the byte scanner has to skip the RTCP body + PLAY 200 OK text instead.
+    s_play_buf_len = s_play_buf_offset = 0;
     if (rtsp_connect() < 0) {
         ESP_LOGE(TAG, "Failed to connect to RTSP server");
         return;
     }
-    
+
     if (rtsp_handshake() < 0) {
         ESP_LOGE(TAG, "RTSP handshake failed");
         close(s_rtsp_sock);
         return;
     }
-    
+
     // Feed SPS/PPS to decoder before receiving any frames
     feed_sps_pps_to_decoder();
-    
-    // Start RTP receiver task
+
+    // Start RTP receiver task (do NOT clear s_play_buf here — handshake may have
+    // populated it with the first RTP/RTCP interleaved header from the PLAY response)
     s_rtp_task_exit = false;
     s_last_rtp_time = esp_log_timestamp();
     xTaskCreatePinnedToCore(rtp_receiver_task, "rtp_rx", 8192, NULL, 8, &s_rtp_task_handle, 1);
 
     // Main loop - monitor status and handle reconnection
-    uint32_t last_keepalive = 0;
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(1000));
         ESP_LOGI(TAG, "Frames decoded: %lu", (unsigned long)s_frame_count);
 
-        // Send RTSP keepalive (OPTIONS) every 20 seconds
-        uint32_t now = esp_log_timestamp();
-        if (now - last_keepalive > 20000 && s_rtsp_sock >= 0) {
-            rtsp_request("OPTIONS", RTSP_URL, NULL, s_rtsp_response, sizeof(s_rtsp_response));
-            last_keepalive = now;
-        }
-
         // Check for RTP inactivity timeout or TCP receiver task exit
+        uint32_t now = esp_log_timestamp();
         bool reconnect_needed = false;
         if (s_rtsp_sock < 0) {
             ESP_LOGW(TAG, "RTSP socket closed, attempting to reconnect...");
@@ -1061,22 +1109,27 @@ void app_main(void)
         if (reconnect_needed) {
             // Clean up decoder and buffers if needed
             h264_decoder_deinit();
-            // Signal previous RTP receiver task to exit if running
+            // Signal the RTP task to stop.
             if (s_rtp_task_handle != NULL) {
                 s_rtp_task_exit = true;
-                // Wait for the task to exit
+            }
+            // Close the RTSP socket BEFORE waiting for the task.
+            // The TCP interleaved receiver blocks inside recv(s_rtsp_sock).
+            // Closing the socket immediately unblocks that call so the task
+            // can exit instead of waiting up to SO_RCVTIMEO seconds.
+            if (s_rtsp_sock >= 0) {
+                close(s_rtsp_sock);
+                s_rtsp_sock = -1;
+            }
+            // Now wait for the task to exit (should happen within a few ms).
+            if (s_rtp_task_handle != NULL) {
                 int wait_count = 0;
                 while (s_rtp_task_handle != NULL && wait_count++ < 100) {
                     vTaskDelay(pdMS_TO_TICKS(10));
                 }
                 s_rtp_task_exit = false;
             }
-            // Always close RTSP socket if not already closed
-            if (s_rtsp_sock >= 0) {
-                close(s_rtsp_sock);
-                s_rtsp_sock = -1;
-            }
-            // Always close RTP socket if not already closed
+            // s_rtp_sock is unused (TCP mode) but close if somehow set.
             if (s_rtp_sock >= 0) {
                 close(s_rtp_sock);
                 s_rtp_sock = -1;
@@ -1091,8 +1144,9 @@ void app_main(void)
                 ESP_LOGE(TAG, "Failed to reinitialize H.264 decoder");
                 continue;
             }
-            // Clear Session ID before handshake
+            // Clear Session ID and pre-buffer BEFORE handshake.
             s_session_id[0] = '\0';
+            s_play_buf_len = s_play_buf_offset = 0;  // clear stale bytes from previous session
             // Attempt to reconnect
             vTaskDelay(pdMS_TO_TICKS(2000));
             if (rtsp_connect() < 0) {
@@ -1108,7 +1162,18 @@ void app_main(void)
                 continue;
             }
             feed_sps_pps_to_decoder();
-            // Restart RTP receiver task
+            // Reset RTP depacketizer state so the new session doesn't generate a
+            // massive false sequence-number gap against the old session's last seq.
+            s_first_packet = true;
+            s_nal_length = 0;
+            s_skip_until_fu_start = true;
+            s_got_idr = false;
+            // Intentionally do NOT clear s_idr_accum_len / s_idr_slice_cnt.
+            // Any IDR accumulated before the reconnect is still valid for the
+            // same stream and can be used with the freshly initialized decoder
+            // so the first P-slice after reconnect gets a reference frame.
+            s_decoder_has_idr = false;  // New decoder instance needs IDR before P-slices
+            // Restart RTP receiver task (do NOT clear s_play_buf here)
             s_rtp_task_exit = false;
             s_last_rtp_time = esp_log_timestamp();
             xTaskCreatePinnedToCore(rtp_receiver_task, "rtp_rx", 8192, NULL, 5, &s_rtp_task_handle, 1);

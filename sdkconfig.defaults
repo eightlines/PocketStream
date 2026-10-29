@@ -25,3 +25,15 @@ CONFIG_ESP_H264_DECODER_IRAM=n
 # This case uses the terminal to print the brief diagrams before encoding and after decoding.
 # Turn off the watchdog to ensure the integrity of the picture printing
 CONFIG_ESP_TASK_WDT_EN=n
+
+# ─── Performance ───────────────────────────────────────────────────────────────
+# -O2 instead of the debug -Og default: the YUV→RGB and scaling loops are
+# plain C and run several times faster optimized.
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+
+# Larger TCP receive window so the RTSP sender keeps streaming while a frame is
+# being decoded/drawn (was 5760 bytes ≈ 4 packets). The recv mailbox must hold
+# at least TCP_WND / TCP_MSS + 2 segments.
+CONFIG_LWIP_TCP_WND_DEFAULT=65535
+CONFIG_LWIP_TCP_RECVMBOX_SIZE=64
+CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=64

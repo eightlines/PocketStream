@@ -9,10 +9,13 @@
  * @brief Decoded frame callback function type
  * 
  * @param frame_data Pointer to decoded YUV420 (I420) frame data
- * @param width Frame width in pixels
- * @param height Frame height in pixels
+ * @param width Frame width in pixels (0 if the decoder could not report it)
+ * @param height Frame height in pixels (0 if the decoder could not report it)
  * @param size Frame data size in bytes
  * @param user_ctx User context passed during init
+ *
+ * Called synchronously from h264_decoder_decode(); frame_data is only valid
+ * for the duration of the call.
  */
 typedef void (*h264_frame_callback_t)(uint8_t *frame_data, uint16_t width, uint16_t height, uint32_t size, void *user_ctx);
 

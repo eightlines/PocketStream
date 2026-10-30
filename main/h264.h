@@ -6,18 +6,33 @@
 #include "esp_err.h"
 
 /**
+ * @brief A decoded I420 frame.
+ *
+ * The decoder works in 16-pixel macroblocks, so the buffer holds the coded
+ * size (e.g. 368×368 for a 360×360 stream). The visible picture is the
+ * width×height rectangle at (x, y), taken from the SPS cropping fields.
+ * Plane strides are coded_w (Y) and coded_w / 2 (U, V).
+ */
+typedef struct {
+    uint8_t  *data;      /**< I420: Y plane, then U, then V (coded size) */
+    uint32_t  size;      /**< Bytes in data */
+    uint16_t  coded_w;   /**< Buffer width in pixels (0 if unknown) */
+    uint16_t  coded_h;   /**< Buffer height in pixels (0 if unknown) */
+    uint16_t  x, y;      /**< Top-left of the visible picture */
+    uint16_t  width;     /**< Visible width (0 if unknown) */
+    uint16_t  height;    /**< Visible height (0 if unknown) */
+} h264_frame_t;
+
+/**
  * @brief Decoded frame callback function type
  * 
- * @param frame_data Pointer to decoded YUV420 (I420) frame data
- * @param width Frame width in pixels (0 if the decoder could not report it)
- * @param height Frame height in pixels (0 if the decoder could not report it)
- * @param size Frame data size in bytes
+ * @param frame Decoded frame (see h264_frame_t)
  * @param user_ctx User context passed during init
  *
- * Called synchronously from h264_decoder_decode(); frame_data is only valid
+ * Called synchronously from h264_decoder_decode(); frame->data is only valid
  * for the duration of the call.
  */
-typedef void (*h264_frame_callback_t)(uint8_t *frame_data, uint16_t width, uint16_t height, uint32_t size, void *user_ctx);
+typedef void (*h264_frame_callback_t)(const h264_frame_t *frame, void *user_ctx);
 
 /**
  * @brief H.264 decoder configuration
@@ -60,5 +75,24 @@ esp_err_t h264_decoder_deinit(void);
  * @return true if initialized, false otherwise
  */
 bool h264_decoder_is_initialized(void);
+
+/**
+ * @brief Picture geometry from a sequence parameter set.
+ */
+typedef struct {
+    uint16_t coded_w, coded_h;   /**< Macroblock-aligned size */
+    uint16_t x, y;               /**< Crop offset (left, top) */
+    uint16_t width, height;      /**< Visible size after cropping */
+} h264_sps_info_t;
+
+/**
+ * @brief Parse picture size and cropping from an SPS NAL unit.
+ *
+ * @param nal SPS NAL unit starting at the NAL header byte (no start code)
+ * @param len Length in bytes
+ * @param out Parsed geometry
+ * @return true on success
+ */
+bool h264_parse_sps(const uint8_t *nal, int len, h264_sps_info_t *out);
 
 #endif // H264_H

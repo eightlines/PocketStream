@@ -32,6 +32,27 @@ void yuv420_to_rgb565(const uint8_t *y_plane, const uint8_t *u_plane, const uint
 void i420_to_rgb565(const uint8_t *i420_data, uint16_t *rgb_out, uint16_t width, uint16_t height);
 
 /**
+ * @brief Fast I420 → RGB565 with plane strides (bit-identical to yuv420_to_rgb565)
+ *
+ * Works on 2×2 blocks so each U/V sample is read and its colour terms
+ * computed once for four pixels, clamps through lookup tables, and writes two
+ * pixels per 32-bit store. Strides allow converting a cropped window of a
+ * larger decoded frame in place.
+ *
+ * @param y_plane   First visible Y sample
+ * @param u_plane   First visible U sample
+ * @param v_plane   First visible V sample
+ * @param y_stride  Bytes per Y row
+ * @param uv_stride Bytes per U/V row
+ * @param rgb_out   Output, width × height, compact (2 bytes per pixel)
+ * @param width     Visible width in pixels
+ * @param height    Visible height in pixels
+ */
+void yuv420_to_rgb565_fast(const uint8_t *y_plane, const uint8_t *u_plane, const uint8_t *v_plane,
+                           int y_stride, int uv_stride,
+                           uint16_t *rgb_out, int width, int height);
+
+/**
  * @brief Calculate RGB565 buffer size needed for given dimensions
  * 
  * @param width Frame width

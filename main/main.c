@@ -39,8 +39,14 @@ static uint16_t  s_last_dec_h     = 0;
 #define PS_RENDER_PRIO    6      // above speech (5), below the receiver (8)
 #define PS_RENDER_STACK   6144
 
+// Planes of an I420 picture (possibly a window into a larger decoded frame).
 typedef struct {
-    uint8_t  *yuv;     // I420 frame
+    const uint8_t *y, *u, *v;
+    int y_stride, uv_stride;
+} yuv_view_t;
+
+typedef struct {
+    uint8_t  *yuv;     // compact I420 frame (visible area only)
     size_t    cap;     // allocated bytes
     uint16_t  w, h;
 } ps_frame_slot_t;
@@ -249,9 +255,9 @@ static bool render_hw(const uint16_t *rgb, uint16_t w, uint16_t h)
 
 // ─── Render (render task, or receiver task if the pipeline isn't running) ───
 
-// Convert, scale and show one I420 frame. If slot >= 0 it is returned to the
-// free queue as soon as the YUV data has been consumed.
-static void render_frame(const uint8_t *yuv, uint16_t width, uint16_t height, int slot)
+// Convert, scale and show one I420 picture. If slot >= 0 it is returned to
+// the free queue as soon as the YUV data has been consumed.
+static void render_frame(const yuv_view_t *pic, uint16_t width, uint16_t height, int slot)
 {
     // RGB565 buffer (reallocated on resolution change)
     if (width != s_input_width || height != s_input_height || !s_rgb_buffer) {
@@ -279,13 +285,14 @@ static void render_frame(const uint8_t *yuv, uint16_t width, uint16_t height, in
 
 #if PS_DEBUG
     uint32_t y_sum = 0;
-    for (int i = 0; i < (int)(width * height); i += 31) y_sum += yuv[i];
+    for (int r = 0; r < height; r += 8) y_sum += pic->y[r * pic->y_stride];
     ESP_LOGI(TAG, "Y checksum=0x%08lx Y[0]=%u Y[1]=%u",
-             (unsigned long)y_sum, yuv[0], yuv[1]);
+             (unsigned long)y_sum, pic->y[0], pic->y[1]);
 #endif
 
     int64_t t = ps_now_us();
-    i420_to_rgb565(yuv, s_rgb_buffer, width, height);
+    yuv420_to_rgb565_fast(pic->y, pic->u, pic->v, pic->y_stride, pic->uv_stride,
+                          s_rgb_buffer, width, height);
     ps_perf_add(PS_STAGE_CONVERT, t);
 
     // YUV consumed: let the receiver refill this slot while we scale.
@@ -328,7 +335,13 @@ static void render_task(void *arg)
     while (1) {
         uint8_t i;
         if (xQueueReceive(s_ready_q, &i, portMAX_DELAY) != pdTRUE) continue;
-        render_frame(s_slots[i].yuv, s_slots[i].w, s_slots[i].h, i);
+        ps_frame_slot_t *s = &s_slots[i];
+        size_t ysz = (size_t)s->w * s->h, csz = (size_t)((s->w + 1) / 2) * ((s->h + 1) / 2);
+        yuv_view_t pic = {
+            .y = s->yuv, .u = s->yuv + ysz, .v = s->yuv + ysz + csz,
+            .y_stride = s->w, .uv_stride = (s->w + 1) / 2,
+        };
+        render_frame(&pic, s->w, s->h, i);
     }
 }
 
@@ -351,45 +364,64 @@ static void pipeline_start(void)
 
 // ─── Frame callback (receiver task, called from the H.264 decoder) ───────────
 
-static void on_frame_decoded(uint8_t *frame_data, uint16_t width, uint16_t height,
-                             uint32_t size, void *user_ctx)
+static void on_frame_decoded(const h264_frame_t *frame, void *user_ctx)
 {
-    if (!frame_data || size == 0) return;
+    if (!frame || !frame->data || frame->size == 0) return;
+
+    uint16_t coded_w = frame->coded_w, coded_h = frame->coded_h;
+    uint16_t x0 = frame->x, y0 = frame->y;
+    uint16_t width = frame->width, height = frame->height;
 
     // Fallback when the decoder couldn't report the size: infer it from the
-    // I420 buffer size (W×H = size×2/3), assuming a square frame.
-    if (width == 0 || height == 0) {
-        uint32_t pixels = (size * 2) / 3;
+    // I420 buffer size (W×H = size×2/3), assuming a square, uncropped frame.
+    if (coded_w == 0 || coded_h == 0 || width == 0 || height == 0) {
+        uint32_t pixels = (frame->size * 2) / 3;
         uint16_t side   = (uint16_t)sqrtf((float)pixels);
         if (side > 0 && (uint32_t)side * side == pixels) {
-            width = height = side;
+            coded_w = coded_h = width = height = side;
         } else {
-            width  = s_last_dec_w ? s_last_dec_w : 256;
-            height = s_last_dec_h ? s_last_dec_h : 256;
+            coded_w = width  = s_last_dec_w ? s_last_dec_w : 256;
+            coded_h = height = s_last_dec_h ? s_last_dec_h : 256;
         }
+        x0 = y0 = 0;
     }
-    size_t need = (size_t)width * height * 3 / 2;
-    if (size < need) {
-        ESP_LOGW(TAG, "Short frame: %lu bytes for %dx%d", (unsigned long)size, width, height);
+    if (frame->size < (uint32_t)coded_w * coded_h * 3 / 2 ||
+            x0 + width > coded_w || y0 + height > coded_h) {
+        ESP_LOGW(TAG, "Bad frame geometry: %lu bytes, coded %dx%d, visible %dx%d at %d,%d",
+                 (unsigned long)frame->size, coded_w, coded_h, width, height, x0, y0);
         return;
     }
-    s_last_dec_w = width;
-    s_last_dec_h = height;
+    s_last_dec_w = coded_w;
+    s_last_dec_h = coded_h;
     if (PS_PERF) g_ps_perf.decoded++;
 
+    // Visible window inside the decoder's buffer (crop offsets are even).
+    const uint8_t *Y = frame->data;
+    const uint8_t *U = Y + (size_t)coded_w * coded_h;
+    const uint8_t *V = U + (size_t)(coded_w / 2) * (coded_h / 2);
+    yuv_view_t src = {
+        .y = Y + (size_t)y0 * coded_w + x0,
+        .u = U + (size_t)(y0 / 2) * (coded_w / 2) + x0 / 2,
+        .v = V + (size_t)(y0 / 2) * (coded_w / 2) + x0 / 2,
+        .y_stride = coded_w, .uv_stride = coded_w / 2,
+    };
+
     if (!s_pipelined) {
-        // frame_data is only valid during this callback, so render it now.
-        render_frame(frame_data, width, height, -1);
+        // frame->data is only valid during this callback, so render it now.
+        render_frame(&src, width, height, -1);
         return;
     }
 
-    // The decoder reuses frame_data on the next call, so copy it into a slot.
+    // The decoder reuses its buffer on the next call, so copy the visible
+    // area into a compact slot (this is also where the crop happens).
     uint8_t i;
     if (xQueueReceive(s_free_q, &i, 0) != pdTRUE) {
         if (PS_PERF) g_ps_perf.dropped++;   // render still busy with both slots
         return;
     }
     ps_frame_slot_t *slot = &s_slots[i];
+    int cw = (width + 1) / 2, ch = (height + 1) / 2;
+    size_t need = (size_t)width * height + 2 * (size_t)cw * ch;
     if (slot->cap < need) {
         free(slot->yuv);
         slot->yuv = heap_caps_malloc(need, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -402,7 +434,16 @@ static void on_frame_decoded(uint8_t *frame_data, uint16_t width, uint16_t heigh
         }
     }
     int64_t t = ps_now_us();
-    memcpy(slot->yuv, frame_data, need);
+    uint8_t *dy = slot->yuv, *du = dy + (size_t)width * height, *dv = du + (size_t)cw * ch;
+    if (src.y_stride == width) {
+        memcpy(dy, src.y, (size_t)width * height);
+    } else {
+        for (int r = 0; r < height; r++) memcpy(dy + (size_t)r * width, src.y + (size_t)r * src.y_stride, width);
+    }
+    for (int r = 0; r < ch; r++) {
+        memcpy(du + (size_t)r * cw, src.u + (size_t)r * src.uv_stride, cw);
+        memcpy(dv + (size_t)r * cw, src.v + (size_t)r * src.uv_stride, cw);
+    }
     ps_perf_add(PS_STAGE_COPY, t);
     slot->w = width;
     slot->h = height;

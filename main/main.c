@@ -34,7 +34,10 @@ static uint16_t  s_last_dec_h     = 0;
 //                         a free slot → hand it to the render task.
 // Render task (core 0):   slot → YUV→RGB → (slot freed) → PPA scale → swap.
 // A slot index is owned by exactly one side at a time; the queues pass it.
-#define PS_FRAME_SLOTS    2
+// 4 slots absorb bursty arrival (decoded rate swings 10-40 fps at 360x360)
+// instead of dropping; costs ~200 KB PSRAM per slot at 360x360 and up to
+// 3 frames of extra latency while a burst drains.
+#define PS_FRAME_SLOTS    4
 #define PS_RENDER_CORE    0
 #define PS_RENDER_PRIO    6      // above speech (5), below the receiver (8)
 #define PS_RENDER_STACK   6144

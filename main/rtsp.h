@@ -14,7 +14,11 @@
  * The decoder_cfg is copied internally and reused on every reconnect when
  * the decoder is re-initialized.
  *
- * @return ESP_OK on success, ESP_FAIL on any allocation or connection error.
+ * If the server or stream is not available yet, the supervisor is started
+ * anyway and keeps reconnecting until it is.
+ *
+ * @return ESP_OK on success (including "not connected yet, retrying"),
+ *         ESP_FAIL on allocation or decoder errors.
  */
 esp_err_t rtsp_client_start(const h264_decoder_config_t *decoder_cfg);
 

@@ -797,7 +797,7 @@ static void do_reconnect(void)
     // Restart receiver task
     s_rtp_task_exit = false;
     s_last_rtp_time = esp_log_timestamp();
-    xTaskCreatePinnedToCore(rtp_receiver_task, "rtp_rx", 8192, NULL, 5,
+    xTaskCreatePinnedToCore(rtp_receiver_task, "rtp_rx", 8192, NULL, 8,
                             &s_rtp_task_handle, 1);
     ESP_LOGI(TAG, "RTSP reconnection complete.");
 }
@@ -851,28 +851,29 @@ esp_err_t rtsp_client_start(const h264_decoder_config_t *decoder_cfg)
     // Clear pre-buffer BEFORE handshake so rtsp_request() can populate it
     s_play_buf_len = s_play_buf_offset = 0;
 
+    // If the server or stream isn't there yet, don't give up: the supervisor
+    // below sees the closed socket and keeps retrying via do_reconnect().
+    bool connected = false;
     if (rtsp_connect() < 0) {
-        ESP_LOGE(TAG, "Failed to connect to RTSP server");
-        h264_decoder_deinit();
-        free(s_nal_alloc); s_nal_alloc = s_nal_buffer = NULL;
-        return ESP_FAIL;
-    }
-    if (rtsp_handshake() < 0) {
-        ESP_LOGE(TAG, "RTSP handshake failed");
+        ESP_LOGW(TAG, "RTSP server not reachable yet — will keep retrying");
+    } else if (rtsp_handshake() < 0) {
+        ESP_LOGW(TAG, "RTSP handshake failed (no stream yet?) — will keep retrying");
         if (s_rtsp_sock >= 0) { close(s_rtsp_sock); s_rtsp_sock = -1; }
-        h264_decoder_deinit();
-        free(s_nal_alloc); s_nal_alloc = s_nal_buffer = NULL;
-        return ESP_FAIL;
+    } else {
+        connected = true;
     }
-    feed_sps_pps_to_decoder();
-    s_sps_pps_fed = true;
 
-    // Start RTP receiver (do NOT clear s_play_buf — handshake may have
-    // populated it with the first RTP/RTCP header from the PLAY response)
-    s_rtp_task_exit = false;
-    s_last_rtp_time = esp_log_timestamp();
-    xTaskCreatePinnedToCore(rtp_receiver_task, "rtp_rx", 8192, NULL, 8,
-                            &s_rtp_task_handle, 1);
+    if (connected) {
+        feed_sps_pps_to_decoder();
+        s_sps_pps_fed = true;
+
+        // Start RTP receiver (do NOT clear s_play_buf — handshake may have
+        // populated it with the first RTP/RTCP header from the PLAY response)
+        s_rtp_task_exit = false;
+        s_last_rtp_time = esp_log_timestamp();
+        xTaskCreatePinnedToCore(rtp_receiver_task, "rtp_rx", 8192, NULL, 8,
+                                &s_rtp_task_handle, 1);
+    }
 
     // Start supervisor (handles inactivity timeout and reconnects)
     xTaskCreatePinnedToCore(rtsp_supervisor_task, "rtsp_super", 4096, NULL, 4,

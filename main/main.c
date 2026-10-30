@@ -6,6 +6,7 @@
 #include "esp_log.h"
 #include "nvs_flash.h"
 #include "esp_heap_caps.h"
+#include "driver/ppa.h"
 #include "ethernet.h"
 #include "display.h"
 #include "h264.h"
@@ -24,6 +25,14 @@ static uint16_t *s_rgb_buffer     = NULL;  // reallocated when stream resolution
 static uint32_t  s_frame_count    = 0;
 static uint16_t  s_input_width    = 0;
 static uint16_t  s_input_height   = 0;
+
+// Hardware render path: PPA scales RGB565 straight into the off-screen frame
+// buffer, which is then swapped in. Falls back to CPU scale + copy if any
+// part is unavailable.
+static ppa_client_handle_t s_ppa_srm      = NULL;
+static ppa_client_handle_t s_ppa_fill     = NULL;
+static bool                s_hw_render    = false;
+static int                 s_clear_pending = 0;  // back buffers still to clear after a size change
 
 // ─── Diagnostics ──────────────────────────────────────────────────────────────
 
@@ -105,6 +114,104 @@ static void scale_frame_fit_height(const uint16_t *src, uint16_t *dst,
     }
 }
 
+// ─── Hardware render (PPA + double buffer) ────────────────────────────────────
+
+static void render_init(void)
+{
+    if (!display_has_double_buffer()) {
+        ESP_LOGW(TAG, "Render: CPU scale + copy (no double buffer)");
+        return;
+    }
+    ppa_client_config_t srm_cfg = { .oper_type = PPA_OPERATION_SRM };
+    if (ppa_register_client(&srm_cfg, &s_ppa_srm) != ESP_OK) {
+        ESP_LOGW(TAG, "Render: CPU scale + copy (PPA SRM unavailable)");
+        return;
+    }
+    ppa_client_config_t fill_cfg = { .oper_type = PPA_OPERATION_FILL };
+    if (ppa_register_client(&fill_cfg, &s_ppa_fill) != ESP_OK) s_ppa_fill = NULL;
+    s_hw_render = true;
+    ESP_LOGI(TAG, "Render: PPA scale into double-buffered frame buffer");
+}
+
+// Fit-height scale of an RGB565 frame into the back buffer, centred, with
+// horizontal crop (wide input) or black bars (narrow input), then swap.
+// Returns false if the PPA rejected the job; the caller then uses the CPU path.
+static bool render_hw(const uint16_t *rgb, uint16_t w, uint16_t h)
+{
+    int64_t t = ps_now_us();
+    uint16_t *fb = display_acquire_back_buffer();
+    ps_perf_add(PS_STAGE_DISPLAY, t);
+    if (!fb) return false;
+
+    t = ps_now_us();
+    // PPA scales in 1/16 steps; round down so the result never overflows the
+    // screen (256→720 is ×2.8125 = 45/16 and 360→720 is ×2: both exact).
+    float scale = floorf((float)DISPLAY_HEIGHT * 16.0f / h) / 16.0f;
+    if (scale < 1.0f / 16.0f) scale = 1.0f / 16.0f;
+
+    uint32_t blk_w = w, in_off_x = 0;
+    if ((uint32_t)(scale * w) > DISPLAY_WIDTH) {       // wider than the screen: crop centre
+        blk_w = (uint32_t)(DISPLAY_WIDTH / scale);
+        while (blk_w > 0 && (uint32_t)(scale * blk_w) > DISPLAY_WIDTH) blk_w--;
+        in_off_x = (w - blk_w) / 2;
+    }
+    uint32_t out_w = (uint32_t)(scale * blk_w);
+    uint32_t out_h = (uint32_t)(scale * h);
+    uint32_t out_x = (DISPLAY_WIDTH  - out_w) / 2;
+    uint32_t out_y = (DISPLAY_HEIGHT - out_h) / 2;
+
+    // After a size change, clear each buffer once so old pixels don't linger
+    // in any bars around the picture.
+    if (s_clear_pending > 0) {
+        if (s_ppa_fill && (out_w < DISPLAY_WIDTH || out_h < DISPLAY_HEIGHT)) {
+            ppa_fill_oper_config_t fill = {
+                .out = {
+                    .buffer = fb, .buffer_size = display_frame_buffer_size(),
+                    .pic_w = DISPLAY_WIDTH, .pic_h = DISPLAY_HEIGHT,
+                    .fill_cm = PPA_FILL_COLOR_MODE_RGB565,
+                },
+                .fill_block_w = DISPLAY_WIDTH, .fill_block_h = DISPLAY_HEIGHT,
+                .fill_color_val = 0,
+                .mode = PPA_TRANS_MODE_BLOCKING,
+            };
+            ppa_do_fill(s_ppa_fill, &fill);
+        }
+        s_clear_pending--;
+    }
+
+    ppa_srm_oper_config_t op = {
+        .in = {
+            .buffer = rgb, .pic_w = w, .pic_h = h,
+            .block_w = blk_w, .block_h = h,
+            .block_offset_x = in_off_x, .block_offset_y = 0,
+            .srm_cm = PPA_SRM_COLOR_MODE_RGB565,
+        },
+        .out = {
+            .buffer = fb, .buffer_size = display_frame_buffer_size(),
+            .pic_w = DISPLAY_WIDTH, .pic_h = DISPLAY_HEIGHT,
+            .block_offset_x = out_x, .block_offset_y = out_y,
+            .srm_cm = PPA_SRM_COLOR_MODE_RGB565,
+        },
+        .rotation_angle = PPA_SRM_ROTATION_ANGLE_0,
+        .scale_x = scale,
+        .scale_y = scale,
+        .mode = PPA_TRANS_MODE_BLOCKING,
+    };
+    esp_err_t err = ppa_do_scale_rotate_mirror(s_ppa_srm, &op);
+    ps_perf_add(PS_STAGE_SCALE, t);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "PPA scale failed (%s) for %dx%d — switching to CPU path",
+                 esp_err_to_name(err), w, h);
+        s_hw_render = false;
+        return false;
+    }
+
+    t = ps_now_us();
+    display_present(fb);
+    ps_perf_add(PS_STAGE_DISPLAY, t);
+    return true;
+}
+
 // ─── Frame callback (called from H.264 decoder on each decoded frame) ─────────
 
 static void on_frame_decoded(uint8_t *frame_data, uint16_t width, uint16_t height,
@@ -145,6 +252,7 @@ static void on_frame_decoded(uint8_t *frame_data, uint16_t width, uint16_t heigh
         }
         s_input_width  = width;
         s_input_height = height;
+        s_clear_pending = 2;   // both frame buffers
     }
 
     s_frame_count++;
@@ -171,6 +279,12 @@ static void on_frame_decoded(uint8_t *frame_data, uint16_t width, uint16_t heigh
              (unsigned long)rgb_sum, s_rgb_buffer[0]);
 #endif
 
+    if (s_hw_render && render_hw(s_rgb_buffer, width, height)) {
+        ps_perf_frame_done();
+        return;
+    }
+
+    // CPU fallback: software scale, then copy into the single frame buffer.
     const uint16_t *out = s_rgb_buffer;
     if (width != DISPLAY_WIDTH || height != DISPLAY_HEIGHT) {
         t = ps_now_us();
@@ -217,6 +331,7 @@ void app_main(void)
         ESP_LOGE(TAG, "Failed to allocate display buffer");
         return;
     }
+    render_init();
 
     h264_decoder_config_t h264_cfg = {
         .on_frame_decoded = on_frame_decoded,

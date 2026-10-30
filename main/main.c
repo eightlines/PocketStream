@@ -3,6 +3,7 @@
 #include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
 #include "esp_heap_caps.h"
@@ -23,8 +24,31 @@ static const char *TAG = "App";
 static uint16_t *s_display_buffer = NULL;  // fixed 720×720 for lcd_panel_draw_bitmap
 static uint16_t *s_rgb_buffer     = NULL;  // reallocated when stream resolution changes
 static uint32_t  s_frame_count    = 0;
-static uint16_t  s_input_width    = 0;
+static uint16_t  s_input_width    = 0;    // render task: size of s_rgb_buffer
 static uint16_t  s_input_height   = 0;
+static uint16_t  s_last_dec_w     = 0;    // receiver task: last decoded size
+static uint16_t  s_last_dec_h     = 0;
+
+// ─── Two-core pipeline ────────────────────────────────────────────────────────
+// Receiver task (core 1): network → depacketize → decode → copy the frame into
+//                         a free slot → hand it to the render task.
+// Render task (core 0):   slot → YUV→RGB → (slot freed) → PPA scale → swap.
+// A slot index is owned by exactly one side at a time; the queues pass it.
+#define PS_FRAME_SLOTS    2
+#define PS_RENDER_CORE    0
+#define PS_RENDER_PRIO    6      // above speech (5), below the receiver (8)
+#define PS_RENDER_STACK   6144
+
+typedef struct {
+    uint8_t  *yuv;     // I420 frame
+    size_t    cap;     // allocated bytes
+    uint16_t  w, h;
+} ps_frame_slot_t;
+
+static ps_frame_slot_t s_slots[PS_FRAME_SLOTS];
+static QueueHandle_t   s_free_q   = NULL;   // slot indices ready to be filled
+static QueueHandle_t   s_ready_q  = NULL;   // slot indices ready to be shown
+static bool            s_pipelined = false; // false: render inline on the receiver
 
 // Hardware render path: PPA scales RGB565 straight into the off-screen frame
 // buffer, which is then swapped in. Falls back to CPU scale + copy if any
@@ -41,32 +65,43 @@ ps_perf_t g_ps_perf = {0};
 void ps_perf_frame_done(void)
 {
 #if PS_PERF
-    g_ps_perf.frames++;
+    static ps_perf_t prev;
+    static int64_t   window_start_us = 0;
+
+    g_ps_perf.shown++;
     int64_t now = esp_timer_get_time();
-    if (g_ps_perf.window_start_us == 0) { g_ps_perf.window_start_us = now; return; }
-    int64_t elapsed = now - g_ps_perf.window_start_us;
+    if (window_start_us == 0) { window_start_us = now; prev = g_ps_perf; return; }
+    int64_t elapsed = now - window_start_us;
     if (elapsed < 1000000) return;
 
-    uint32_t n = g_ps_perf.frames ? g_ps_perf.frames : 1;
+    // Snapshot (fields owned by the receiver task are only read here).
+    __asm__ volatile("" ::: "memory");
+    ps_perf_t cur = g_ps_perf;
     float secs = elapsed / 1e6f;
-    // Per-frame averages in ms. "net" is time spent blocked waiting for data —
-    // high net with low fps means the sender/network is the bottleneck.
-    ESP_LOGI("PERF",
-             "%dx%d %.1f fps %lu kbps | ms/frame: net %.1f dec %.1f (max %.1f) "
-             "yuv %.1f scale %.1f disp %.1f | rtp gaps %lu lost %lu",
-             s_input_width, s_input_height,
-             g_ps_perf.frames / secs,
-             (unsigned long)(g_ps_perf.bytes * 8 / 1000 / secs),
-             g_ps_perf.stage_us[PS_STAGE_NET]     / 1000.0f / n,
-             g_ps_perf.stage_us[PS_STAGE_DECODE]  / 1000.0f / n,
-             g_ps_perf.decode_max_us / 1000.0f,
-             g_ps_perf.stage_us[PS_STAGE_CONVERT] / 1000.0f / n,
-             g_ps_perf.stage_us[PS_STAGE_SCALE]   / 1000.0f / n,
-             g_ps_perf.stage_us[PS_STAGE_DISPLAY] / 1000.0f / n,
-             (unsigned long)g_ps_perf.rtp_gaps, (unsigned long)g_ps_perf.rtp_lost);
+    uint32_t shown   = cur.shown   - prev.shown;
+    uint32_t decoded = cur.decoded - prev.decoded;
+    uint32_t dropped = cur.dropped - prev.dropped;
+    float per_dec  = decoded ? 1000.0f * decoded : 1000.0f;  // µs total → ms per frame
+    float per_show = shown   ? 1000.0f * shown   : 1000.0f;
+#define D(stage) ((float)(cur.stage_us[stage] - prev.stage_us[stage]))
 
-    memset(&g_ps_perf, 0, sizeof(g_ps_perf));
-    g_ps_perf.window_start_us = now;
+    ESP_LOGI("PERF",
+             "%dx%d %.1f fps (decoded %.1f, dropped %lu) %lu kbps | "
+             "rx core ms: net %.1f dec %.1f (max %.1f) copy %.1f | "
+             "render core ms: yuv %.1f scale %.1f disp %.1f | rtp gaps %lu lost %lu",
+             s_input_width, s_input_height,
+             shown / secs, decoded / secs, (unsigned long)dropped,
+             (unsigned long)((cur.bytes - prev.bytes) * 8 / 1000 / secs),
+             D(PS_STAGE_NET) / per_dec, D(PS_STAGE_DECODE) / per_dec,
+             cur.decode_max_us / 1000.0f, D(PS_STAGE_COPY) / per_dec,
+             D(PS_STAGE_CONVERT) / per_show, D(PS_STAGE_SCALE) / per_show,
+             D(PS_STAGE_DISPLAY) / per_show,
+             (unsigned long)(cur.rtp_gaps - prev.rtp_gaps),
+             (unsigned long)(cur.rtp_lost - prev.rtp_lost));
+#undef D
+    prev = cur;
+    window_start_us = now;
+    g_ps_perf.window++;
 #endif
 }
 
@@ -212,30 +247,12 @@ static bool render_hw(const uint16_t *rgb, uint16_t w, uint16_t h)
     return true;
 }
 
-// ─── Frame callback (called from H.264 decoder on each decoded frame) ─────────
+// ─── Render (render task, or receiver task if the pipeline isn't running) ───
 
-static void on_frame_decoded(uint8_t *frame_data, uint16_t width, uint16_t height,
-                             uint32_t size, void *user_ctx)
+// Convert, scale and show one I420 frame. If slot >= 0 it is returned to the
+// free queue as soon as the YUV data has been consumed.
+static void render_frame(const uint8_t *yuv, uint16_t width, uint16_t height, int slot)
 {
-    if (!frame_data || size == 0) return;
-
-    // Fallback when the decoder couldn't report the size: infer it from the
-    // I420 buffer size (W×H = size×2/3), assuming a square frame.
-    if (width == 0 || height == 0) {
-        uint32_t pixels = (size * 2) / 3;
-        uint16_t side   = (uint16_t)sqrtf((float)pixels);
-        if (side > 0 && (uint32_t)side * side == pixels) {
-            width = height = side;
-        } else {
-            width  = s_input_width  ? s_input_width  : 256;
-            height = s_input_height ? s_input_height : 256;
-        }
-    }
-    if (size < (uint32_t)width * height * 3 / 2) {
-        ESP_LOGW(TAG, "Short frame: %lu bytes for %dx%d", (unsigned long)size, width, height);
-        return;
-    }
-
     // RGB565 buffer (reallocated on resolution change)
     if (width != s_input_width || height != s_input_height || !s_rgb_buffer) {
         ESP_LOGI(TAG, "Detected video resolution: %dx%d", width, height);
@@ -248,6 +265,8 @@ static void on_frame_decoded(uint8_t *frame_data, uint16_t width, uint16_t heigh
                                MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
         if (!s_rgb_buffer) {
             ESP_LOGE(TAG, "Failed to allocate RGB buffer for %dx%d", width, height);
+            s_input_width = s_input_height = 0;
+            if (slot >= 0) { uint8_t i = slot; xQueueSend(s_free_q, &i, 0); }
             return;
         }
         s_input_width  = width;
@@ -256,21 +275,21 @@ static void on_frame_decoded(uint8_t *frame_data, uint16_t width, uint16_t heigh
     }
 
     s_frame_count++;
-    PS_LOGV(TAG, "Frame #%lu: %dx%d (%lu bytes)",
-            (unsigned long)s_frame_count, width, height, (unsigned long)size);
+    PS_LOGV(TAG, "Frame #%lu: %dx%d", (unsigned long)s_frame_count, width, height);
 
 #if PS_DEBUG
     uint32_t y_sum = 0;
-    for (int i = 0; i < (int)(width * height); i += 31) y_sum += frame_data[i];
+    for (int i = 0; i < (int)(width * height); i += 31) y_sum += yuv[i];
     ESP_LOGI(TAG, "Y checksum=0x%08lx Y[0]=%u Y[1]=%u",
-             (unsigned long)y_sum, frame_data[0], frame_data[1]);
+             (unsigned long)y_sum, yuv[0], yuv[1]);
 #endif
 
-    // Convert straight from the decoder's output buffer — it stays valid for
-    // the duration of this callback, so no intermediate copy is needed.
     int64_t t = ps_now_us();
-    i420_to_rgb565(frame_data, s_rgb_buffer, width, height);
+    i420_to_rgb565(yuv, s_rgb_buffer, width, height);
     ps_perf_add(PS_STAGE_CONVERT, t);
+
+    // YUV consumed: let the receiver refill this slot while we scale.
+    if (slot >= 0) { uint8_t i = slot; xQueueSend(s_free_q, &i, 0); }
 
 #if PS_DEBUG
     uint32_t rgb_sum = 0;
@@ -303,6 +322,93 @@ static void on_frame_decoded(uint8_t *frame_data, uint16_t width, uint16_t heigh
     ps_perf_frame_done();
 }
 
+static void render_task(void *arg)
+{
+    ESP_LOGI(TAG, "Render task started (core %d)", xPortGetCoreID());
+    while (1) {
+        uint8_t i;
+        if (xQueueReceive(s_ready_q, &i, portMAX_DELAY) != pdTRUE) continue;
+        render_frame(s_slots[i].yuv, s_slots[i].w, s_slots[i].h, i);
+    }
+}
+
+static void pipeline_start(void)
+{
+    s_free_q  = xQueueCreate(PS_FRAME_SLOTS, sizeof(uint8_t));
+    s_ready_q = xQueueCreate(PS_FRAME_SLOTS, sizeof(uint8_t));
+    if (!s_free_q || !s_ready_q) {
+        ESP_LOGW(TAG, "Pipeline: no queues, rendering on the receiver task");
+        return;
+    }
+    for (uint8_t i = 0; i < PS_FRAME_SLOTS; i++) xQueueSend(s_free_q, &i, 0);
+    if (xTaskCreatePinnedToCore(render_task, "render", PS_RENDER_STACK, NULL,
+                                PS_RENDER_PRIO, NULL, PS_RENDER_CORE) != pdPASS) {
+        ESP_LOGW(TAG, "Pipeline: no render task, rendering on the receiver task");
+        return;
+    }
+    s_pipelined = true;
+}
+
+// ─── Frame callback (receiver task, called from the H.264 decoder) ───────────
+
+static void on_frame_decoded(uint8_t *frame_data, uint16_t width, uint16_t height,
+                             uint32_t size, void *user_ctx)
+{
+    if (!frame_data || size == 0) return;
+
+    // Fallback when the decoder couldn't report the size: infer it from the
+    // I420 buffer size (W×H = size×2/3), assuming a square frame.
+    if (width == 0 || height == 0) {
+        uint32_t pixels = (size * 2) / 3;
+        uint16_t side   = (uint16_t)sqrtf((float)pixels);
+        if (side > 0 && (uint32_t)side * side == pixels) {
+            width = height = side;
+        } else {
+            width  = s_last_dec_w ? s_last_dec_w : 256;
+            height = s_last_dec_h ? s_last_dec_h : 256;
+        }
+    }
+    size_t need = (size_t)width * height * 3 / 2;
+    if (size < need) {
+        ESP_LOGW(TAG, "Short frame: %lu bytes for %dx%d", (unsigned long)size, width, height);
+        return;
+    }
+    s_last_dec_w = width;
+    s_last_dec_h = height;
+    if (PS_PERF) g_ps_perf.decoded++;
+
+    if (!s_pipelined) {
+        // frame_data is only valid during this callback, so render it now.
+        render_frame(frame_data, width, height, -1);
+        return;
+    }
+
+    // The decoder reuses frame_data on the next call, so copy it into a slot.
+    uint8_t i;
+    if (xQueueReceive(s_free_q, &i, 0) != pdTRUE) {
+        if (PS_PERF) g_ps_perf.dropped++;   // render still busy with both slots
+        return;
+    }
+    ps_frame_slot_t *slot = &s_slots[i];
+    if (slot->cap < need) {
+        free(slot->yuv);
+        slot->yuv = heap_caps_malloc(need, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!slot->yuv) slot->yuv = malloc(need);
+        slot->cap = slot->yuv ? need : 0;
+        if (!slot->yuv) {
+            ESP_LOGE(TAG, "Failed to allocate frame slot for %dx%d", width, height);
+            xQueueSend(s_free_q, &i, 0);
+            return;
+        }
+    }
+    int64_t t = ps_now_us();
+    memcpy(slot->yuv, frame_data, need);
+    ps_perf_add(PS_STAGE_COPY, t);
+    slot->w = width;
+    slot->h = height;
+    xQueueSend(s_ready_q, &i, 0);
+}
+
 // ─── Entry point ──────────────────────────────────────────────────────────────
 
 void app_main(void)
@@ -332,6 +438,7 @@ void app_main(void)
         return;
     }
     render_init();
+    pipeline_start();
 
     h264_decoder_config_t h264_cfg = {
         .on_frame_decoded = on_frame_decoded,

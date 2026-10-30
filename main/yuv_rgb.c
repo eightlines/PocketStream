@@ -122,3 +122,44 @@ void yuv420_to_rgb565_fast(const uint8_t *y_plane, const uint8_t *u_plane, const
     }
 }
 
+// ─── Packed YUV420 (P4 hardware layout) ───────────────────────────────────────
+
+void i420_to_yuv420_packed(const uint8_t *y_plane, const uint8_t *u_plane, const uint8_t *v_plane,
+                           int y_stride, int uv_stride,
+                           uint8_t *out, int width, int height)
+{
+    const int row_bytes = width * 3 / 2;
+    for (int y = 0; y < height; y += 2) {
+        const uint8_t *y0 = y_plane + y * y_stride;
+        const uint8_t *y1 = y0 + y_stride;
+        const uint8_t *u  = u_plane + (y / 2) * uv_stride;
+        const uint8_t *v  = v_plane + (y / 2) * uv_stride;
+        uint8_t *o0 = out + (size_t)y * row_bytes;
+        uint8_t *o1 = o0 + row_bytes;
+        for (int x = 0; x < width; x += 2) {
+            o0[0] = *u++; o0[1] = y0[x]; o0[2] = y0[x + 1]; o0 += 3;
+            o1[0] = *v++; o1[1] = y1[x]; o1[2] = y1[x + 1]; o1 += 3;
+        }
+    }
+}
+
+void yuv420_packed_to_rgb565(const uint8_t *in, uint16_t *rgb_out, int width, int height)
+{
+    if (!s_lut_ready) build_luts();
+    const int row_bytes = width * 3 / 2;
+    for (int y = 0; y < height; y += 2) {
+        const uint8_t *r0 = in + (size_t)y * row_bytes;
+        const uint8_t *r1 = r0 + row_bytes;
+        uint16_t *o0 = rgb_out + (size_t)y * width;
+        uint16_t *o1 = o0 + width;
+        for (int x = 0; x < width; x += 2, r0 += 3, r1 += 3) {
+            int D = r0[0] - 128, E = r1[0] - 128;
+            int rd = (359 * E) >> 8, gd = (88 * D + 183 * E) >> 8, bd = (454 * D) >> 8;
+            o0[x]     = PIX(r0[1] + LUT_OFS);
+            o0[x + 1] = PIX(r0[2] + LUT_OFS);
+            o1[x]     = PIX(r1[1] + LUT_OFS);
+            o1[x + 1] = PIX(r1[2] + LUT_OFS);
+        }
+    }
+}
+

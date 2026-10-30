@@ -39,6 +39,14 @@ static uint16_t  s_last_dec_h     = 0;
 #define PS_RENDER_PRIO    6      // above speech (5), below the receiver (8)
 #define PS_RENDER_STACK   6144
 
+// 1: the receiver repacks each frame into the P4's packed YUV420 layout while
+// copying it into the slot, and the PPA converts YUV→RGB *and* scales in one
+// hardware pass (no CPU colour conversion on the render core).
+// 0: compact I420 slots, CPU YUV→RGB, PPA scales RGB565.
+#ifndef PS_PPA_YUV
+#define PS_PPA_YUV        1
+#endif
+
 // Planes of an I420 picture (possibly a window into a larger decoded frame).
 typedef struct {
     const uint8_t *y, *u, *v;
@@ -46,9 +54,10 @@ typedef struct {
 } yuv_view_t;
 
 typedef struct {
-    uint8_t  *yuv;     // compact I420 frame (visible area only)
+    uint8_t  *yuv;     // visible area only: compact I420, or packed YUV420
     size_t    cap;     // allocated bytes
     uint16_t  w, h;
+    bool      packed;  // true: packed YUV420 for the PPA
 } ps_frame_slot_t;
 
 static ps_frame_slot_t s_slots[PS_FRAME_SLOTS];
@@ -62,6 +71,7 @@ static bool            s_pipelined = false; // false: render inline on the recei
 static ppa_client_handle_t s_ppa_srm      = NULL;
 static ppa_client_handle_t s_ppa_fill     = NULL;
 static bool                s_hw_render    = false;
+static volatile bool       s_ppa_yuv_ok   = PS_PPA_YUV;  // PPA accepts packed YUV420 input
 static int                 s_clear_pending = 0;  // back buffers still to clear after a size change
 
 // ─── Diagnostics ──────────────────────────────────────────────────────────────
@@ -171,14 +181,16 @@ static void render_init(void)
     ppa_client_config_t fill_cfg = { .oper_type = PPA_OPERATION_FILL };
     if (ppa_register_client(&fill_cfg, &s_ppa_fill) != ESP_OK) s_ppa_fill = NULL;
     s_hw_render = true;
-    ESP_LOGI(TAG, "Render: PPA scale into double-buffered frame buffer");
+    ESP_LOGI(TAG, "Render: PPA %s into double-buffered frame buffer",
+             s_ppa_yuv_ok ? "YUV420→RGB565 convert + scale" : "scale");
 }
 
 // Fit-height scale of an RGB565 frame into the back buffer, centred, with
 // horizontal crop (wide input) or black bars (narrow input), then swap.
 // Returns false if the PPA rejected the job; the caller then uses the CPU path.
-static bool render_hw(const uint16_t *rgb, uint16_t w, uint16_t h)
+static bool render_hw(const void *src, ppa_srm_color_mode_t src_cm, uint16_t w, uint16_t h)
 {
+    const bool yuv_in = (src_cm == PPA_SRM_COLOR_MODE_YUV420);
     int64_t t = ps_now_us();
     uint16_t *fb = display_acquire_back_buffer();
     ps_perf_add(PS_STAGE_DISPLAY, t);
@@ -196,6 +208,7 @@ static bool render_hw(const uint16_t *rgb, uint16_t w, uint16_t h)
         while (blk_w > 0 && (uint32_t)(scale * blk_w) > DISPLAY_WIDTH) blk_w--;
         in_off_x = (w - blk_w) / 2;
     }
+    if (yuv_in) { blk_w &= ~1u; in_off_x &= ~1u; }   // PPA: YUV420 blocks must be even
     uint32_t out_w = (uint32_t)(scale * blk_w);
     uint32_t out_h = (uint32_t)(scale * h);
     uint32_t out_x = (DISPLAY_WIDTH  - out_w) / 2;
@@ -222,10 +235,13 @@ static bool render_hw(const uint16_t *rgb, uint16_t w, uint16_t h)
 
     ppa_srm_oper_config_t op = {
         .in = {
-            .buffer = rgb, .pic_w = w, .pic_h = h,
+            .buffer = src, .pic_w = w, .pic_h = h,
             .block_w = blk_w, .block_h = h,
             .block_offset_x = in_off_x, .block_offset_y = 0,
-            .srm_cm = PPA_SRM_COLOR_MODE_RGB565,
+            .srm_cm = src_cm,
+            // H.264 from x264/OBS is limited-range BT.601 by default.
+            .yuv_range = PPA_COLOR_RANGE_LIMIT,
+            .yuv_std = PPA_COLOR_CONV_STD_RGB_YUV_BT601,
         },
         .out = {
             .buffer = fb, .buffer_size = display_frame_buffer_size(),
@@ -241,9 +257,15 @@ static bool render_hw(const uint16_t *rgb, uint16_t w, uint16_t h)
     esp_err_t err = ppa_do_scale_rotate_mirror(s_ppa_srm, &op);
     ps_perf_add(PS_STAGE_SCALE, t);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "PPA scale failed (%s) for %dx%d — switching to CPU path",
-                 esp_err_to_name(err), w, h);
-        s_hw_render = false;
+        if (yuv_in) {
+            ESP_LOGE(TAG, "PPA YUV420 input rejected (%s) for %dx%d — converting on the CPU instead",
+                     esp_err_to_name(err), w, h);
+            s_ppa_yuv_ok = false;
+        } else {
+            ESP_LOGE(TAG, "PPA scale failed (%s) for %dx%d — switching to CPU path",
+                     esp_err_to_name(err), w, h);
+            s_hw_render = false;
+        }
         return false;
     }
 
@@ -255,9 +277,11 @@ static bool render_hw(const uint16_t *rgb, uint16_t w, uint16_t h)
 
 // ─── Render (render task, or receiver task if the pipeline isn't running) ───
 
-// Convert, scale and show one I420 picture. If slot >= 0 it is returned to
-// the free queue as soon as the YUV data has been consumed.
-static void render_frame(const yuv_view_t *pic, uint16_t width, uint16_t height, int slot)
+// Convert, scale and show one picture: planar I420 (pic) or packed YUV420
+// (packed). If slot >= 0 it is returned to the free queue as soon as the YUV
+// data has been consumed.
+static void render_frame(const yuv_view_t *pic, const uint8_t *packed,
+                         uint16_t width, uint16_t height, int slot)
 {
     // RGB565 buffer (reallocated on resolution change)
     if (width != s_input_width || height != s_input_height || !s_rgb_buffer) {
@@ -283,17 +307,31 @@ static void render_frame(const yuv_view_t *pic, uint16_t width, uint16_t height,
     s_frame_count++;
     PS_LOGV(TAG, "Frame #%lu: %dx%d", (unsigned long)s_frame_count, width, height);
 
+    int64_t t;
+    if (packed) {
+        // PPA converts and scales in one pass; the slot is read by the PPA,
+        // so it can only be released afterwards.
+        if (s_hw_render && s_ppa_yuv_ok &&
+                render_hw(packed, PPA_SRM_COLOR_MODE_YUV420, width, height)) {
+            if (slot >= 0) { uint8_t i = slot; xQueueSend(s_free_q, &i, 0); }
+            ps_perf_frame_done();
+            return;
+        }
+        t = ps_now_us();
+        yuv420_packed_to_rgb565(packed, s_rgb_buffer, width, height);
+        ps_perf_add(PS_STAGE_CONVERT, t);
+    } else {
 #if PS_DEBUG
-    uint32_t y_sum = 0;
-    for (int r = 0; r < height; r += 8) y_sum += pic->y[r * pic->y_stride];
-    ESP_LOGI(TAG, "Y checksum=0x%08lx Y[0]=%u Y[1]=%u",
-             (unsigned long)y_sum, pic->y[0], pic->y[1]);
+        uint32_t y_sum = 0;
+        for (int r = 0; r < height; r += 8) y_sum += pic->y[r * pic->y_stride];
+        ESP_LOGI(TAG, "Y checksum=0x%08lx Y[0]=%u Y[1]=%u",
+                 (unsigned long)y_sum, pic->y[0], pic->y[1]);
 #endif
-
-    int64_t t = ps_now_us();
-    yuv420_to_rgb565_fast(pic->y, pic->u, pic->v, pic->y_stride, pic->uv_stride,
-                          s_rgb_buffer, width, height);
-    ps_perf_add(PS_STAGE_CONVERT, t);
+        t = ps_now_us();
+        yuv420_to_rgb565_fast(pic->y, pic->u, pic->v, pic->y_stride, pic->uv_stride,
+                              s_rgb_buffer, width, height);
+        ps_perf_add(PS_STAGE_CONVERT, t);
+    }
 
     // YUV consumed: let the receiver refill this slot while we scale.
     if (slot >= 0) { uint8_t i = slot; xQueueSend(s_free_q, &i, 0); }
@@ -305,7 +343,7 @@ static void render_frame(const yuv_view_t *pic, uint16_t width, uint16_t height,
              (unsigned long)rgb_sum, s_rgb_buffer[0]);
 #endif
 
-    if (s_hw_render && render_hw(s_rgb_buffer, width, height)) {
+    if (s_hw_render && render_hw(s_rgb_buffer, PPA_SRM_COLOR_MODE_RGB565, width, height)) {
         ps_perf_frame_done();
         return;
     }
@@ -336,12 +374,16 @@ static void render_task(void *arg)
         uint8_t i;
         if (xQueueReceive(s_ready_q, &i, portMAX_DELAY) != pdTRUE) continue;
         ps_frame_slot_t *s = &s_slots[i];
+        if (s->packed) {
+            render_frame(NULL, s->yuv, s->w, s->h, i);
+            continue;
+        }
         size_t ysz = (size_t)s->w * s->h, csz = (size_t)((s->w + 1) / 2) * ((s->h + 1) / 2);
         yuv_view_t pic = {
             .y = s->yuv, .u = s->yuv + ysz, .v = s->yuv + ysz + csz,
             .y_stride = s->w, .uv_stride = (s->w + 1) / 2,
         };
-        render_frame(&pic, s->w, s->h, i);
+        render_frame(&pic, NULL, s->w, s->h, i);
     }
 }
 
@@ -408,7 +450,7 @@ static void on_frame_decoded(const h264_frame_t *frame, void *user_ctx)
 
     if (!s_pipelined) {
         // frame->data is only valid during this callback, so render it now.
-        render_frame(&src, width, height, -1);
+        render_frame(&src, NULL, width, height, -1);
         return;
     }
 
@@ -421,7 +463,8 @@ static void on_frame_decoded(const h264_frame_t *frame, void *user_ctx)
     }
     ps_frame_slot_t *slot = &s_slots[i];
     int cw = (width + 1) / 2, ch = (height + 1) / 2;
-    size_t need = (size_t)width * height + 2 * (size_t)cw * ch;
+    bool pack = s_hw_render && s_ppa_yuv_ok && !(width & 1) && !(height & 1);
+    size_t need = (size_t)width * height + 2 * (size_t)cw * ch;  // same size either way
     if (slot->cap < need) {
         free(slot->yuv);
         slot->yuv = heap_caps_malloc(need, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -434,17 +477,23 @@ static void on_frame_decoded(const h264_frame_t *frame, void *user_ctx)
         }
     }
     int64_t t = ps_now_us();
-    uint8_t *dy = slot->yuv, *du = dy + (size_t)width * height, *dv = du + (size_t)cw * ch;
-    if (src.y_stride == width) {
-        memcpy(dy, src.y, (size_t)width * height);
+    if (pack) {
+        i420_to_yuv420_packed(src.y, src.u, src.v, src.y_stride, src.uv_stride,
+                              slot->yuv, width, height);
     } else {
-        for (int r = 0; r < height; r++) memcpy(dy + (size_t)r * width, src.y + (size_t)r * src.y_stride, width);
-    }
-    for (int r = 0; r < ch; r++) {
-        memcpy(du + (size_t)r * cw, src.u + (size_t)r * src.uv_stride, cw);
-        memcpy(dv + (size_t)r * cw, src.v + (size_t)r * src.uv_stride, cw);
+        uint8_t *dy = slot->yuv, *du = dy + (size_t)width * height, *dv = du + (size_t)cw * ch;
+        if (src.y_stride == width) {
+            memcpy(dy, src.y, (size_t)width * height);
+        } else {
+            for (int r = 0; r < height; r++) memcpy(dy + (size_t)r * width, src.y + (size_t)r * src.y_stride, width);
+        }
+        for (int r = 0; r < ch; r++) {
+            memcpy(du + (size_t)r * cw, src.u + (size_t)r * src.uv_stride, cw);
+            memcpy(dv + (size_t)r * cw, src.v + (size_t)r * src.uv_stride, cw);
+        }
     }
     ps_perf_add(PS_STAGE_COPY, t);
+    slot->packed = pack;
     slot->w = width;
     slot->h = height;
     xQueueSend(s_ready_q, &i, 0);

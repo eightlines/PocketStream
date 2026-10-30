@@ -37,3 +37,10 @@ CONFIG_COMPILER_OPTIMIZATION_PERF=y
 CONFIG_LWIP_TCP_WND_DEFAULT=65535
 CONFIG_LWIP_TCP_RECVMBOX_SIZE=64
 CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=64
+
+# Ethernet receive buffering: 30 x 1536 B (was 20 x 512 B, ~10 KB). With the
+# small default, short pile-ups dropped packets at the MAC; TCP then waited
+# for a retransmit timeout and delivered video in bursts. 30 is the Kconfig
+# maximum; the size must be 64-byte aligned on the ESP32-P4.
+CONFIG_ETH_DMA_RX_BUFFER_NUM=30
+CONFIG_ETH_DMA_BUFFER_SIZE=1536

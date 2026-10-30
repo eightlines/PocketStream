@@ -43,8 +43,10 @@ static uint16_t  s_last_dec_h     = 0;
 // copying it into the slot, and the PPA converts YUV→RGB *and* scales in one
 // hardware pass (no CPU colour conversion on the render core).
 // 0: compact I420 slots, CPU YUV→RGB, PPA scales RGB565.
+// Default 0: on the test board (2026-10-29) the first YUV420 SRM transaction
+// never completed, hanging the render task (blocking PPA call) — black screen.
 #ifndef PS_PPA_YUV
-#define PS_PPA_YUV        1
+#define PS_PPA_YUV        0
 #endif
 
 // Planes of an I420 picture (possibly a window into a larger decoded frame).

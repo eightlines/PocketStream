@@ -50,7 +50,13 @@ static const char *TAG = "RTSP";
 // TD/LIVE555 keyframe interval is unknown — 30s if conservative, 5s is a
 // reasonable default.  Adjust upward if the stream consistently sends an IDR
 // later than this (set to at least keyframe_interval + 2s).
-#define RTP_INACTIVITY_TIMEOUT 5000
+#define RTP_INACTIVITY_TIMEOUT 2000
+
+// Reconnect pacing: the first retry is quick; repeated failures (e.g. the
+// publisher is restarting and the server answers 404) back off up to the max.
+#define RECONNECT_DELAY_MIN_MS  300
+#define RECONNECT_DELAY_MAX_MS  2000
+#define SUPERVISOR_POLL_MS      250
 
 // ─── Module state ─────────────────────────────────────────────────────────────
 
@@ -102,6 +108,8 @@ static int     s_play_buf_offset = 0;
 
 // RTP timing / task handles
 static volatile uint32_t s_last_rtp_time  = 0;
+static volatile bool     s_conn_lost      = false;  // receiver saw the server close
+static uint32_t          s_retry_delay_ms = RECONNECT_DELAY_MIN_MS;
 static volatile bool     s_rtp_task_exit  = false;
 static TaskHandle_t      s_rtp_task_handle       = NULL;
 static TaskHandle_t      s_supervisor_task_handle = NULL;
@@ -203,24 +211,24 @@ static void parse_sprop_from_sdp(const char *sdp)
     if (!comma || comma > end) { ESP_LOGW(TAG, "Invalid sprop-parameter-sets format"); return; }
 
     int sps_b64_len = comma - sprop;
-    ESP_LOGI(TAG, "SPS base64 (%d chars): %.*s", sps_b64_len, sps_b64_len, sprop);
+    PS_LOGV(TAG, "SPS base64 (%d chars): %.*s", sps_b64_len, sps_b64_len, sprop);
     s_sps_len = base64_decode(sprop, sps_b64_len, s_sps, sizeof(s_sps));
-    ESP_LOGI(TAG, "Decoded SPS: %d bytes", s_sps_len);
+    PS_LOGV(TAG, "Decoded SPS: %d bytes", s_sps_len);
     if (s_sps_len >= 4) {
-        ESP_LOGI(TAG, "SPS: nal=%02X profile=%d constraints=%02X level=%d",
+        PS_LOGV(TAG, "SPS: nal=%02X profile=%d constraints=%02X level=%d",
                  s_sps[0], s_sps[1], s_sps[2], s_sps[3]);
-        ESP_LOGI(TAG, "SPS hex: %02X %02X %02X %02X %02X %02X %02X %02X",
+        PS_LOGV(TAG, "SPS hex: %02X %02X %02X %02X %02X %02X %02X %02X",
                  s_sps[0], s_sps[1], s_sps[2], s_sps[3],
                  s_sps[4], s_sps[5], s_sps[6], s_sps[7]);
     }
 
     const char *pps_start = comma + 1;
     int pps_b64_len = end - pps_start;
-    ESP_LOGI(TAG, "PPS base64 (%d chars): %.*s", pps_b64_len, pps_b64_len, pps_start);
+    PS_LOGV(TAG, "PPS base64 (%d chars): %.*s", pps_b64_len, pps_b64_len, pps_start);
     s_pps_len = base64_decode(pps_start, pps_b64_len, s_pps, sizeof(s_pps));
-    ESP_LOGI(TAG, "Decoded PPS: %d bytes", s_pps_len);
+    PS_LOGV(TAG, "Decoded PPS: %d bytes", s_pps_len);
     if (s_pps_len >= 2) {
-        ESP_LOGI(TAG, "PPS hex: %02X %02X %02X %02X",
+        PS_LOGV(TAG, "PPS hex: %02X %02X %02X %02X",
                  s_pps[0], s_pps[1],
                  s_pps_len > 2 ? s_pps[2] : 0,
                  s_pps_len > 3 ? s_pps[3] : 0);
@@ -240,7 +248,7 @@ static void parse_track_from_sdp(const char *sdp)
                 if (len < (int)sizeof(s_track_path) - 1) {
                     strncpy(s_track_path, control, len);
                     s_track_path[len] = '\0';
-                    ESP_LOGI(TAG, "Found track: %s", s_track_path);
+                    PS_LOGV(TAG, "Found track: %s", s_track_path);
                     return;
                 }
             }
@@ -262,7 +270,7 @@ static void parse_session(const char *response)
         if (len < (int)sizeof(s_session_id) - 1) {
             strncpy(s_session_id, session, len);
             s_session_id[len] = '\0';
-            ESP_LOGI(TAG, "Session ID: %s", s_session_id);
+            PS_LOGV(TAG, "Session ID: %s", s_session_id);
         }
     }
 }
@@ -290,7 +298,7 @@ static int rtsp_request(const char *method, const char *uri,
                         "%s\r\n", extra_headers);
     }
 
-    ESP_LOGI(TAG, "TX:\n%s", s_rtsp_request);
+    PS_LOGV(TAG, "TX:\n%s", s_rtsp_request);
     if (send(s_rtsp_sock, s_rtsp_request, len, 0) < 0) {
         ESP_LOGE(TAG, "Failed to send request");
         return -1;
@@ -307,7 +315,7 @@ static int rtsp_request(const char *method, const char *uri,
         memcpy(s_play_buf, response, save);
         s_play_buf_len    = save;
         s_play_buf_offset = 0;
-        ESP_LOGI(TAG, "RX: RTP before PLAY 200 OK — saved %d bytes "
+        PS_LOGV(TAG, "RX: RTP before PLAY 200 OK — saved %d bytes "
                       "(hdr: %02X %02X %02X %02X)",
                  save,
                  (uint8_t)response[0], (uint8_t)response[1],
@@ -315,9 +323,13 @@ static int rtsp_request(const char *method, const char *uri,
         return received;
     }
 
-    ESP_LOGI(TAG, "RX:\n%s", response);
+    PS_LOGV(TAG, "RX:\n%s", response);
     if (strstr(response, "200 OK") == NULL) {
-        ESP_LOGE(TAG, "Request failed");
+        // First line only, e.g. "RTSP/1.0 404 Not Found"
+        int n = strcspn(response, "\r\n");
+        PS_LOGV(TAG, "%s failed: %.*s", method, n, response);
+        if (strcmp(method, "DESCRIBE") != 0)   // DESCRIBE 404 = no stream yet; reported by the caller
+            ESP_LOGW(TAG, "%s failed: %.*s", method, n, response);
         return -1;
     }
     return received;
@@ -346,7 +358,7 @@ static int rtsp_connect(void)
         s_rtsp_sock = -1;
         return -1;
     }
-    ESP_LOGI(TAG, "Connected to RTSP server %s:%d", RTSP_HOST, RTSP_PORT);
+    PS_LOGV(TAG, "Connected to RTSP server %s:%d", RTSP_HOST, RTSP_PORT);
     return 0;
 }
 
@@ -376,7 +388,7 @@ static int rtsp_handshake(void)
     if (rtsp_request("PLAY", RTSP_URL, "Range: npt=0.000-\r\n",
                      s_rtsp_response, sizeof(s_rtsp_response)) < 0) return -1;
 
-    ESP_LOGI(TAG, "RTSP handshake complete");
+    ESP_LOGI(TAG, "Streaming from %s", RTSP_URL);
     return 0;
 }
 
@@ -389,16 +401,16 @@ static void feed_sps_pps_to_decoder(void)
     if (s_sps_len > 0) {
         nal_buf[0] = 0; nal_buf[1] = 0; nal_buf[2] = 0; nal_buf[3] = 1;
         memcpy(nal_buf + 4, s_sps, s_sps_len);
-        ESP_LOGI(TAG, "Feeding SPS to decoder (%d bytes)", s_sps_len + 4);
+        PS_LOGV(TAG, "Feeding SPS to decoder (%d bytes)", s_sps_len + 4);
         ret = h264_decoder_decode(nal_buf, s_sps_len + 4);
-        ESP_LOGI(TAG, "SPS decode result: %d", ret);
+        PS_LOGV(TAG, "SPS decode result: %d", ret);
     }
     if (s_pps_len > 0) {
         nal_buf[0] = 0; nal_buf[1] = 0; nal_buf[2] = 0; nal_buf[3] = 1;
         memcpy(nal_buf + 4, s_pps, s_pps_len);
-        ESP_LOGI(TAG, "Feeding PPS to decoder (%d bytes)", s_pps_len + 4);
+        PS_LOGV(TAG, "Feeding PPS to decoder (%d bytes)", s_pps_len + 4);
         ret = h264_decoder_decode(nal_buf, s_pps_len + 4);
-        ESP_LOGI(TAG, "PPS decode result: %d", ret);
+        PS_LOGV(TAG, "PPS decode result: %d", ret);
     }
 }
 
@@ -656,18 +668,18 @@ static int read_interleaved_rtp(uint8_t *buf, int buf_size)
     while (true) {
         if (buffered_read_exact(s_rtsp_sock, hdr, 1) <= 0) {
             if (skip_count > 0)
-                ESP_LOGI(TAG, "Byte scanner: error after %d skipped bytes", skip_count);
+                PS_LOGV(TAG, "Byte scanner: error after %d skipped bytes", skip_count);
             return -1;
         }
         if (hdr[0] == '$') break;
         skip_count++;
         if (skip_count == 1 || skip_count % 200 == 0)
-            ESP_LOGI(TAG, "Byte scanner: skip #%d byte=0x%02X '%c'",
+            PS_LOGV(TAG, "Byte scanner: skip #%d byte=0x%02X '%c'",
                      skip_count, hdr[0],
                      (hdr[0] >= 32 && hdr[0] < 127) ? hdr[0] : '.');
     }
     if (skip_count > 0)
-        ESP_LOGI(TAG, "Byte scanner: found '$' after %d skipped bytes", skip_count);
+        PS_LOGV(TAG, "Byte scanner: found '$' after %d skipped bytes", skip_count);
 
     if (buffered_read_exact(s_rtsp_sock, hdr + 1, 3) <= 0) return -1;
 
@@ -708,7 +720,7 @@ static void rtp_receiver_task(void *arg)
         return;
     }
 
-    ESP_LOGI(TAG, "TCP interleaved RTP receiver started");
+    PS_LOGV(TAG, "TCP interleaved RTP receiver started");
     int packet_count = 0;
 
     while (!s_rtp_task_exit) {
@@ -727,7 +739,14 @@ static void rtp_receiver_task(void *arg)
     }
 
     free(buffer);
-    ESP_LOGI(TAG, "TCP receiver exited");
+    if (!s_rtp_task_exit) {
+        // Server closed the connection (e.g. the publisher restarted):
+        // tell the supervisor to reconnect now instead of waiting for the
+        // inactivity timeout.
+        s_conn_lost = true;
+        ESP_LOGW(TAG, "Connection to RTSP server lost");
+    }
+    PS_LOGV(TAG, "TCP receiver exited");
     s_rtp_task_handle = NULL;
     vTaskDelete(NULL);
 }
@@ -753,6 +772,7 @@ static void do_reconnect(void)
         return;
     }
     s_rtp_task_exit = false;
+    s_conn_lost     = false;   // handled; further retries go via the closed socket
 
     // Safe now: nothing else is using the decoder.
     h264_decoder_deinit();
@@ -770,17 +790,23 @@ static void do_reconnect(void)
     s_session_id[0] = '\0';
     s_play_buf_len = s_play_buf_offset = 0;
 
-    vTaskDelay(pdMS_TO_TICKS(2000));
+    vTaskDelay(pdMS_TO_TICKS(s_retry_delay_ms));
+    uint32_t next_delay = s_retry_delay_ms * 2;
+    if (next_delay > RECONNECT_DELAY_MAX_MS) next_delay = RECONNECT_DELAY_MAX_MS;
 
     if (rtsp_connect() < 0) {
-        ESP_LOGE(TAG, "Reconnect failed");
+        ESP_LOGW(TAG, "Reconnect failed, retrying in %lu ms", (unsigned long)next_delay);
+        s_retry_delay_ms = next_delay;
         return;
     }
     if (rtsp_handshake() < 0) {
-        ESP_LOGE(TAG, "Handshake failed after reconnect");
+        ESP_LOGW(TAG, "No stream yet (handshake failed), retrying in %lu ms",
+                 (unsigned long)next_delay);
         if (s_rtsp_sock >= 0) { close(s_rtsp_sock); s_rtsp_sock = -1; }
+        s_retry_delay_ms = next_delay;
         return;
     }
+    s_retry_delay_ms = RECONNECT_DELAY_MIN_MS;
     feed_sps_pps_to_decoder();
 
     // Reset depacketizer state. The new decoder instance needs a fresh IDR;
@@ -795,11 +821,12 @@ static void do_reconnect(void)
     s_sps_pps_fed         = true;  // fed just above
 
     // Restart receiver task
+    s_conn_lost     = false;
     s_rtp_task_exit = false;
     s_last_rtp_time = esp_log_timestamp();
     xTaskCreatePinnedToCore(rtp_receiver_task, "rtp_rx", 8192, NULL, 8,
                             &s_rtp_task_handle, 1);
-    ESP_LOGI(TAG, "RTSP reconnection complete.");
+    PS_LOGV(TAG, "RTSP reconnection complete.");
 }
 
 // ─── Supervisor task ──────────────────────────────────────────────────────────
@@ -807,11 +834,14 @@ static void do_reconnect(void)
 static void rtsp_supervisor_task(void *arg)
 {
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        vTaskDelay(pdMS_TO_TICKS(SUPERVISOR_POLL_MS));
         uint32_t now = esp_log_timestamp();
 
         if (s_rtsp_sock < 0) {
-            ESP_LOGW(TAG, "RTSP socket closed, reconnecting...");
+            PS_LOGV(TAG, "RTSP socket closed, reconnecting...");
+            do_reconnect();
+        } else if (s_conn_lost) {
+            ESP_LOGW(TAG, "Reconnecting...");
             do_reconnect();
         } else if ((now - s_last_rtp_time) > RTP_INACTIVITY_TIMEOUT) {
             ESP_LOGW(TAG, "RTP inactivity timeout (%d ms), reconnecting...",

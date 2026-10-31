@@ -126,6 +126,27 @@ bool h264_parse_sps(const uint8_t *nal, int len, h264_sps_info_t *out)
     }
     if (b.err) return false;
 
+    // VUI colour description (optional; spec defaults: limited range,
+    // unspecified matrix). Read errors here don't invalidate the geometry.
+    bool full_range = false;
+    uint8_t matrix = 2;
+    if (br_u(&b, 1)) {                              // vui_parameters_present_flag
+        if (br_u(&b, 1)) {                          // aspect_ratio_info_present_flag
+            if (br_u(&b, 8) == 255) { br_u(&b, 16); br_u(&b, 16); }   // Extended_SAR
+        }
+        if (br_u(&b, 1)) br_u(&b, 1);               // overscan_info / overscan_appropriate
+        if (br_u(&b, 1)) {                          // video_signal_type_present_flag
+            br_u(&b, 3);                            // video_format
+            uint32_t fr = br_u(&b, 1);              // video_full_range_flag
+            uint32_t m = 2;
+            if (br_u(&b, 1)) {                      // colour_description_present_flag
+                br_u(&b, 8); br_u(&b, 8);           // colour_primaries, transfer
+                m = br_u(&b, 8);                    // matrix_coefficients
+            }
+            if (!b.err) { full_range = fr; matrix = (uint8_t)m; }
+        }
+    }
+
     uint32_t coded_w = w_mbs * 16;
     uint32_t coded_h = h_map * 16 * (2 - frame_mbs_only);
     uint32_t cux = (chroma_format_idc == 1 || chroma_format_idc == 2) ? 2 : 1;
@@ -140,6 +161,8 @@ bool h264_parse_sps(const uint8_t *nal, int len, h264_sps_info_t *out)
     out->y = y;
     out->width  = coded_w - cux * (cl + cr);
     out->height = coded_h - cuy * (ct + cb);
+    out->full_range = full_range;
+    out->matrix = matrix;
     return true;
 }
 
@@ -153,8 +176,10 @@ static void note_sps(const uint8_t *data, uint32_t size)
     h264_sps_info_t info;
     if (h264_parse_sps(data + sc, size - sc, &info)) {
         if (!s_sps_valid || memcmp(&info, &s_sps_info, sizeof(info)) != 0)
-            ESP_LOGI(TAG, "SPS: %ux%u visible (coded %ux%u, offset %u,%u)",
-                     info.width, info.height, info.coded_w, info.coded_h, info.x, info.y);
+            ESP_LOGI(TAG, "SPS: %ux%u visible (coded %ux%u, offset %u,%u), %s range, %s",
+                     info.width, info.height, info.coded_w, info.coded_h, info.x, info.y,
+                     info.full_range ? "full" : "limited",
+                     info.matrix == 1 ? "BT.709" : (info.matrix == 2 ? "BT.601 (unspecified)" : "BT.601"));
         s_sps_info = info;
         s_sps_valid = true;
     }
@@ -262,6 +287,8 @@ esp_err_t h264_decoder_decode(const uint8_t *data, uint32_t size)
                     s_sps_info.coded_w == f.coded_w && s_sps_info.coded_h == f.coded_h) {
                 f.x = s_sps_info.x;           f.y = s_sps_info.y;
                 f.width = s_sps_info.width;   f.height = s_sps_info.height;
+                f.full_range = s_sps_info.full_range;
+                f.bt709 = (s_sps_info.matrix == 1);
             } else {
                 f.width = f.coded_w;          f.height = f.coded_h;
             }

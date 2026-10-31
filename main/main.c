@@ -63,6 +63,7 @@ typedef struct {
     size_t    cap;     // allocated bytes
     uint16_t  w, h;
     bool      packed;  // true: packed YUV420 for the PPA
+    bool      full_range, bt709;   // colorimetry from the SPS
 } ps_frame_slot_t;
 
 static ps_frame_slot_t s_slots[PS_FRAME_SLOTS];
@@ -77,6 +78,8 @@ static ppa_client_handle_t s_ppa_srm      = NULL;
 static ppa_client_handle_t s_ppa_fill     = NULL;
 static bool                s_hw_render    = false;
 static volatile bool       s_ppa_yuv_ok   = PS_PPA_YUV;  // PPA accepts packed YUV420 input
+static bool                s_cur_full_range = false;      // colorimetry of the frame being rendered
+static bool                s_cur_bt709      = false;
 static int                 s_clear_pending = 0;  // back buffers still to clear after a size change
 
 // ─── Diagnostics ──────────────────────────────────────────────────────────────
@@ -102,16 +105,17 @@ void ps_perf_frame_done(void)
     uint32_t shown   = cur.shown   - prev.shown;
     uint32_t decoded = cur.decoded - prev.decoded;
     uint32_t dropped = cur.dropped - prev.dropped;
+    uint32_t skipped = cur.skipped - prev.skipped;
     float per_dec  = decoded ? 1000.0f * decoded : 1000.0f;  // µs total → ms per frame
     float per_show = shown   ? 1000.0f * shown   : 1000.0f;
 #define D(stage) ((float)(cur.stage_us[stage] - prev.stage_us[stage]))
 
     ESP_LOGI("PERF",
-             "%dx%d %.1f fps (decoded %.1f, dropped %lu) %lu kbps | "
+             "%dx%d %.1f fps (decoded %.1f, skipped %lu, dropped %lu) %lu kbps | "
              "rx core ms: net %.1f dec %.1f (max %.1f) copy %.1f | "
              "render core ms: yuv %.1f scale %.1f disp %.1f | rtp gaps %lu lost %lu",
              s_input_width, s_input_height,
-             shown / secs, decoded / secs, (unsigned long)dropped,
+             shown / secs, decoded / secs, (unsigned long)skipped, (unsigned long)dropped,
              (unsigned long)((cur.bytes - prev.bytes) * 8 / 1000 / secs),
              D(PS_STAGE_NET) / per_dec, D(PS_STAGE_DECODE) / per_dec,
              cur.decode_max_us / 1000.0f, D(PS_STAGE_COPY) / per_dec,
@@ -244,9 +248,9 @@ static bool render_hw(const void *src, ppa_srm_color_mode_t src_cm, uint16_t w, 
             .block_w = blk_w, .block_h = h,
             .block_offset_x = in_off_x, .block_offset_y = 0,
             .srm_cm = src_cm,
-            // H.264 from x264/OBS is limited-range BT.601 by default.
-            .yuv_range = PPA_COLOR_RANGE_LIMIT,
-            .yuv_std = PPA_COLOR_CONV_STD_RGB_YUV_BT601,
+            // Range and matrix come from the stream's SPS (see h264_parse_sps).
+            .yuv_range = s_cur_full_range ? PPA_COLOR_RANGE_FULL : PPA_COLOR_RANGE_LIMIT,
+            .yuv_std = s_cur_bt709 ? PPA_COLOR_CONV_STD_RGB_YUV_BT709 : PPA_COLOR_CONV_STD_RGB_YUV_BT601,
         },
         .out = {
             .buffer = fb, .buffer_size = display_frame_buffer_size(),
@@ -372,24 +376,49 @@ static void render_frame(const yuv_view_t *pic, const uint8_t *packed,
     ps_perf_frame_done();
 }
 
+static void set_colorimetry(bool full_range, bool bt709)
+{
+    if (full_range != s_cur_full_range || bt709 != s_cur_bt709 || s_frame_count == 0)
+        ESP_LOGI(TAG, "Colour: %s range, %s", full_range ? "full" : "limited",
+                 bt709 ? "BT.709" : "BT.601");
+    s_cur_full_range = full_range;
+    s_cur_bt709 = bt709;
+    yuv_rgb_set_colorimetry(full_range, bt709);
+}
+
+// Take the newest ready frame (releasing any older ones) and show it.
+// Returns false if nothing arrived within `wait`.
+static bool render_next(TickType_t wait)
+{
+    uint8_t i;
+    if (xQueueReceive(s_ready_q, &i, wait) != pdTRUE) return false;
+    // Show the newest frame: if more are already waiting, release the
+    // older ones instead of playing a backlog (keeps latency at ~1 frame).
+    uint8_t newer;
+    while (xQueueReceive(s_ready_q, &newer, 0) == pdTRUE) {
+        xQueueSend(s_free_q, &i, 0);
+        if (PS_PERF) g_ps_perf.skipped++;
+        i = newer;
+    }
+    ps_frame_slot_t *s = &s_slots[i];
+    set_colorimetry(s->full_range, s->bt709);
+    if (s->packed) {
+        render_frame(NULL, s->yuv, s->w, s->h, i);
+        return true;
+    }
+    size_t ysz = (size_t)s->w * s->h, csz = (size_t)((s->w + 1) / 2) * ((s->h + 1) / 2);
+    yuv_view_t pic = {
+        .y = s->yuv, .u = s->yuv + ysz, .v = s->yuv + ysz + csz,
+        .y_stride = s->w, .uv_stride = (s->w + 1) / 2,
+    };
+    render_frame(&pic, NULL, s->w, s->h, i);
+    return true;
+}
+
 static void render_task(void *arg)
 {
     ESP_LOGI(TAG, "Render task started (core %d)", xPortGetCoreID());
-    while (1) {
-        uint8_t i;
-        if (xQueueReceive(s_ready_q, &i, portMAX_DELAY) != pdTRUE) continue;
-        ps_frame_slot_t *s = &s_slots[i];
-        if (s->packed) {
-            render_frame(NULL, s->yuv, s->w, s->h, i);
-            continue;
-        }
-        size_t ysz = (size_t)s->w * s->h, csz = (size_t)((s->w + 1) / 2) * ((s->h + 1) / 2);
-        yuv_view_t pic = {
-            .y = s->yuv, .u = s->yuv + ysz, .v = s->yuv + ysz + csz,
-            .y_stride = s->w, .uv_stride = (s->w + 1) / 2,
-        };
-        render_frame(&pic, NULL, s->w, s->h, i);
-    }
+    while (1) render_next(portMAX_DELAY);
 }
 
 static void pipeline_start(void)
@@ -455,6 +484,7 @@ static void on_frame_decoded(const h264_frame_t *frame, void *user_ctx)
 
     if (!s_pipelined) {
         // frame->data is only valid during this callback, so render it now.
+        set_colorimetry(frame->full_range, frame->bt709);
         render_frame(&src, NULL, width, height, -1);
         return;
     }
@@ -499,6 +529,8 @@ static void on_frame_decoded(const h264_frame_t *frame, void *user_ctx)
     }
     ps_perf_add(PS_STAGE_COPY, t);
     slot->packed = pack;
+    slot->full_range = frame->full_range;
+    slot->bt709 = frame->bt709;
     slot->w = width;
     slot->h = height;
     xQueueSend(s_ready_q, &i, 0);

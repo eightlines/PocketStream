@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <stdbool.h>
 
 /**
  * @brief Convert I420 (YUV420 planar) to RGB565
@@ -32,7 +33,22 @@ void yuv420_to_rgb565(const uint8_t *y_plane, const uint8_t *u_plane, const uint
 void i420_to_rgb565(const uint8_t *i420_data, uint16_t *rgb_out, uint16_t width, uint16_t height);
 
 /**
- * @brief Fast I420 → RGB565 with plane strides (bit-identical to yuv420_to_rgb565)
+ * @brief Select the YUV→RGB conversion used by the fast and packed converters.
+ *
+ * @param full_range true: Y/U/V use 0..255; false (H.264 default): limited
+ *                   range, Y 16..235 and U/V 16..240
+ * @param bt709      true: BT.709 matrix; false: BT.601
+ *
+ * Default is limited-range BT.601. Cheap to call every frame: tables are only
+ * rebuilt when the setting changes.
+ */
+void yuv_rgb_set_colorimetry(bool full_range, bool bt709);
+
+/**
+ * @brief Fast I420 → RGB565 with plane strides
+ *
+ * With yuv_rgb_set_colorimetry(true, false) the output is bit-identical to
+ * yuv420_to_rgb565 (full-range BT.601).
  *
  * Works on 2×2 blocks so each U/V sample is read and its colour terms
  * computed once for four pixels, clamps through lookup tables, and writes two

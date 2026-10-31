@@ -21,6 +21,8 @@ typedef struct {
     uint16_t  x, y;      /**< Top-left of the visible picture */
     uint16_t  width;     /**< Visible width (0 if unknown) */
     uint16_t  height;    /**< Visible height (0 if unknown) */
+    bool      full_range;/**< SPS video_full_range_flag (default false = limited) */
+    bool      bt709;     /**< SPS matrix is BT.709 (default false = BT.601) */
 } h264_frame_t;
 
 /**
@@ -83,6 +85,8 @@ typedef struct {
     uint16_t coded_w, coded_h;   /**< Macroblock-aligned size */
     uint16_t x, y;               /**< Crop offset (left, top) */
     uint16_t width, height;      /**< Visible size after cropping */
+    bool     full_range;         /**< VUI video_full_range_flag (false if absent) */
+    uint8_t  matrix;             /**< VUI matrix_coefficients (2 = unspecified) */
 } h264_sps_info_t;
 
 /**

@@ -61,11 +61,19 @@ void i420_to_rgb565(const uint8_t *i420_data, uint16_t *rgb_out, uint16_t width,
 
 // ─── Fast path ────────────────────────────────────────────────────────────────
 
-// Clamp-and-pack tables, indexed by (value + 256). Covers every value the
-// BT.601 terms below can produce (Y 0..255 plus chroma offsets -227..+227).
-#define LUT_OFS  256
-#define LUT_SIZE 768
+// Colorimetry. H.264 from x264 / NVENC is normally limited range (Y 16..235,
+// U/V 16..240) unless the SPS says otherwise; BT.709 vs BT.601 comes from the
+// SPS matrix coefficients. The legacy converter above is full-range BT.601.
+static bool s_full_range = false;
+static bool s_bt709      = false;
+
+// Clamp-and-pack tables, indexed by (value + LUT_OFS). The widest case is
+// limited-range BT.709 blue: Y' -18..278 plus up to ±271 of chroma.
+#define LUT_OFS  384
+#define LUT_SIZE 1024
 static uint16_t s_r_lut[LUT_SIZE], s_g_lut[LUT_SIZE], s_b_lut[LUT_SIZE];
+static int16_t  s_y_lut[256];       // Y → scaled Y' + LUT_OFS
+static int      s_cr, s_cgu, s_cgv, s_cb, s_round;   // chroma coefficients ×256
 static bool     s_lut_ready = false;
 
 static void build_luts(void)
@@ -76,10 +84,32 @@ static void build_luts(void)
         s_g_lut[i] = (uint16_t)((c & 0xFC) << 3);
         s_b_lut[i] = (uint16_t)(c >> 3);
     }
+    if (s_full_range) {
+        for (int y = 0; y < 256; y++) s_y_lut[y] = (int16_t)(y + LUT_OFS);
+        if (s_bt709) { s_cr = 403; s_cgu = 48;  s_cgv = 120; s_cb = 475; s_round = 128; }
+        else         { s_cr = 359; s_cgu = 88;  s_cgv = 183; s_cb = 454; s_round = 0;   } // = legacy
+    } else {
+        // Y' = 1.164 (Y - 16); chroma scaled by 255/224.
+        for (int y = 0; y < 256; y++) s_y_lut[y] = (int16_t)(((298 * (y - 16) + 128) >> 8) + LUT_OFS);
+        if (s_bt709) { s_cr = 459; s_cgu = 55;  s_cgv = 136; s_cb = 541; s_round = 128; }
+        else         { s_cr = 409; s_cgu = 100; s_cgv = 208; s_cb = 516; s_round = 128; }
+    }
     s_lut_ready = true;
 }
 
-#define PIX(Y) (uint16_t)(s_r_lut[(Y) + rd] | s_g_lut[(Y) - gd] | s_b_lut[(Y) + bd])
+void yuv_rgb_set_colorimetry(bool full_range, bool bt709)
+{
+    if (s_lut_ready && full_range == s_full_range && bt709 == s_bt709) return;
+    s_full_range = full_range;
+    s_bt709 = bt709;
+    build_luts();
+}
+
+#define CHROMA(D, E) \
+    int rd = (s_cr * (E) + s_round) >> 8; \
+    int gd = (s_cgu * (D) + s_cgv * (E) + s_round) >> 8; \
+    int bd = (s_cb * (D) + s_round) >> 8;
+#define PIX(Yl) (uint16_t)(s_r_lut[(Yl) + rd] | s_g_lut[(Yl) - gd] | s_b_lut[(Yl) + bd])
 
 void yuv420_to_rgb565_fast(const uint8_t *y_plane, const uint8_t *u_plane, const uint8_t *v_plane,
                            int y_stride, int uv_stride,
@@ -91,11 +121,11 @@ void yuv420_to_rgb565_fast(const uint8_t *y_plane, const uint8_t *u_plane, const
     if ((width & 1) || (height & 1) || ((uintptr_t)rgb_out & 3)) {
         for (int y = 0; y < height; y++) {
             for (int x = 0; x < width; x++) {
-                int Y = y_plane[y * y_stride + x] + LUT_OFS;
+                int Yl = s_y_lut[y_plane[y * y_stride + x]];
                 int D = u_plane[(y / 2) * uv_stride + x / 2] - 128;
                 int E = v_plane[(y / 2) * uv_stride + x / 2] - 128;
-                int rd = (359 * E) >> 8, gd = (88 * D + 183 * E) >> 8, bd = (454 * D) >> 8;
-                rgb_out[y * width + x] = PIX(Y);
+                CHROMA(D, E)
+                rgb_out[y * width + x] = PIX(Yl);
             }
         }
         return;
@@ -111,11 +141,9 @@ void yuv420_to_rgb565_fast(const uint8_t *y_plane, const uint8_t *u_plane, const
         for (int x = 0; x < width; x += 2) {
             int D = *u++ - 128;
             int E = *v++ - 128;
-            int rd = (359 * E) >> 8;
-            int gd = (88 * D + 183 * E) >> 8;
-            int bd = (454 * D) >> 8;
-            int a = y0[x] + LUT_OFS, b = y0[x + 1] + LUT_OFS;
-            int c = y1[x] + LUT_OFS, d = y1[x + 1] + LUT_OFS;
+            CHROMA(D, E)
+            int a = s_y_lut[y0[x]], b = s_y_lut[y0[x + 1]];
+            int c = s_y_lut[y1[x]], d = s_y_lut[y1[x + 1]];
             *o0++ = (uint32_t)PIX(a) | ((uint32_t)PIX(b) << 16);   // little-endian: left pixel low
             *o1++ = (uint32_t)PIX(c) | ((uint32_t)PIX(d) << 16);
         }
@@ -154,11 +182,11 @@ void yuv420_packed_to_rgb565(const uint8_t *in, uint16_t *rgb_out, int width, in
         uint16_t *o1 = o0 + width;
         for (int x = 0; x < width; x += 2, r0 += 3, r1 += 3) {
             int D = r0[0] - 128, E = r1[0] - 128;
-            int rd = (359 * E) >> 8, gd = (88 * D + 183 * E) >> 8, bd = (454 * D) >> 8;
-            o0[x]     = PIX(r0[1] + LUT_OFS);
-            o0[x + 1] = PIX(r0[2] + LUT_OFS);
-            o1[x]     = PIX(r1[1] + LUT_OFS);
-            o1[x + 1] = PIX(r1[2] + LUT_OFS);
+            CHROMA(D, E)
+            o0[x]     = PIX(s_y_lut[r0[1]]);
+            o0[x + 1] = PIX(s_y_lut[r0[2]]);
+            o1[x]     = PIX(s_y_lut[r1[1]]);
+            o1[x + 1] = PIX(s_y_lut[r1[2]]);
         }
     }
 }

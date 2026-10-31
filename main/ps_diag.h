@@ -52,12 +52,13 @@ typedef struct {
     uint32_t decode_max_us;             // worst decode call in the current window
     uint32_t decode_max_window;         // window decode_max_us belongs to
     uint32_t decoded;                   // frames out of the decoder
-    uint32_t dropped;                   // decoded frames dropped (render busy)
+    uint32_t dropped;                   // decoded frames dropped (no free slot)
     uint32_t bytes;                     // RTP bytes received
     uint32_t rtp_gaps;                  // sequence gaps
     uint32_t rtp_lost;                  // packets lost
     // render task
     uint32_t shown;                     // frames displayed
+    uint32_t skipped;                   // older ready frames skipped for a newer one
     uint32_t window;                    // report window counter
 } ps_perf_t;
 

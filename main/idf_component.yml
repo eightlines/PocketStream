@@ -7,3 +7,8 @@ dependencies:
   espressif/esp_jpeg: "*"
   waveshare/esp_lcd_st7703: "*"
   espressif/esp_media_protocols: "*"
+  ## Speech recognition: WakeNet9 + VAD
+  ## After adding this, run: idf.py menuconfig
+  ##   Component config → ESP Speech Recognition → Wake Word Engine
+  ##     → Enable WakeNet → select "Hi ESP" (wn9_hiesp)
+  espressif/esp-sr: "*"

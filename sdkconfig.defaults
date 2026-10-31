@@ -10,7 +10,8 @@ CONFIG_IDF_EXPERIMENTAL_FEATURES=y
 # CPU configuration
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_360=y
 
-CONFIG_ESP_MAIN_TASK_STACK_SIZE=10240
+# AFE model loading needs extra stack headroom (was 10240)
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
 
 # FreeRTOS configurations
 CONFIG_FREERTOS_HZ=1000
@@ -25,3 +26,34 @@ CONFIG_ESP_H264_DECODER_IRAM=n
 # This case uses the terminal to print the brief diagrams before encoding and after decoding.
 # Turn off the watchdog to ensure the integrity of the picture printing
 CONFIG_ESP_TASK_WDT_EN=n
+
+# ─── Partition table ───────────────────────────────────────────────────────────
+# Custom table adds a 'model' partition required by esp-sr.
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# ─── ESP-SR / WakeNet ──────────────────────────────────────────────────────────
+# WakeNet9 with "Hi ESP" wake word.
+# Also configurable via: idf.py menuconfig
+#   → Component config → ESP Speech Recognition → Wake Word Engine
+# VAD uses WebRTC (no model data needed); only WakeNet model is packed (~289 KB).
+CONFIG_SR_WN_WN9_HIESP=y
+
+# ─── Performance ───────────────────────────────────────────────────────────────
+# -O2 instead of the debug -Og default: the YUV→RGB and scaling loops are
+# plain C and run several times faster optimized.
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+
+# Larger TCP receive window so the RTSP sender keeps streaming while a frame is
+# being decoded/drawn (was 5760 bytes ≈ 4 packets). The recv mailbox must hold
+# at least TCP_WND / TCP_MSS + 2 segments.
+CONFIG_LWIP_TCP_WND_DEFAULT=65535
+CONFIG_LWIP_TCP_RECVMBOX_SIZE=64
+CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=64
+
+# Ethernet receive buffering: 30 x 1536 B (was 20 x 512 B, ~10 KB). With the
+# small default, short pile-ups dropped packets at the MAC; TCP then waited
+# for a retransmit timeout and delivered video in bursts. 30 is the Kconfig
+# maximum; the size must be 64-byte aligned on the ESP32-P4.
+CONFIG_ETH_DMA_RX_BUFFER_NUM=30
+CONFIG_ETH_DMA_BUFFER_SIZE=1536

@@ -1,0 +1,12 @@
+# PocketStream custom partition table
+# Flash size: 32 MB
+#
+# model partition required by espressif/esp-sr (WakeNet + VAD models).
+# Build system packs enabled models into srmodels.bin and flashes it here.
+# Model size: wn9_hiesp ≈ 289 KB on disk; 1 MB partition gives ample headroom.
+#
+# Name,    Type, SubType, Offset,   Size
+nvs,       data, nvs,     0x9000,   0x6000,
+phy_init,  data, phy,     0xF000,   0x1000,
+factory,   app,  factory, 0x10000,  0x400000,
+model,     data, spiffs,  0x410000, 0x100000,

@@ -9,6 +9,44 @@ dependencies:
       registry_url: https://components.espressif.com
       type: service
     version: 0.5.3
+  espressif/dl_fft:
+    component_hash: 7dadbd644c0d7ba4733cc3726ec4cff6edf27b043725e1115861dec1609a3d28
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=5.0'
+    source:
+      registry_url: https://components.espressif.com
+      type: service
+    version: 0.3.1
+  espressif/esp-dsp:
+    component_hash: 42dce32d46ac93dc11f60d368e29a830e9661c7345d794b8a45c343479cae636
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=4.2'
+    source:
+      registry_url: https://components.espressif.com
+      type: service
+    version: 1.7.0
+  espressif/esp-sr:
+    component_hash: 46b1f70f8b561714b958d1c455213cca07162755d1b8df53498081199f15136f
+    dependencies:
+    - name: espressif/dl_fft
+      registry_url: https://components.espressif.com
+      require: private
+      version: '>=0.2.0'
+    - name: espressif/esp-dsp
+      registry_url: https://components.espressif.com
+      require: private
+      version: 1.7.0
+    - name: idf
+      require: private
+      version: '>=5.0'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 2.3.1
   espressif/esp_h264:
     component_hash: e0b0212f2bdf1fc289a7370e6e7e69cd19883ae52661c746e9023a7cc7f22255
     dependencies:
@@ -86,11 +124,12 @@ dependencies:
     - esp32p4
     version: 1.0.5
 direct_dependencies:
+- espressif/esp-sr
 - espressif/esp_h264
 - espressif/esp_jpeg
 - espressif/esp_media_protocols
 - idf
 - waveshare/esp_lcd_st7703
-manifest_hash: 5bf2a3afd8944a8853f5e7feda785a2cb5c198c066c96adda4390ffcbc64f360
+manifest_hash: ed68673fad83d22786bf6b7cffd7546b7811063286f2a96b7435c8dfb3e7c80e
 target: esp32p4
 version: 2.0.0

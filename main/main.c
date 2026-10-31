@@ -13,6 +13,7 @@
 #include "h264.h"
 #include "yuv_rgb.h"
 #include "rtsp.h"
+#include "speech.h"
 #include "ps_diag.h"
 
 static const char *TAG = "App";
@@ -576,6 +577,13 @@ void app_main(void)
         return;
     }
 
-    // All ongoing work is handled by the RTSP supervisor and receiver tasks.
+    // Speech: wake word detection + PCM streaming to host.
+    // if (speech_init() == ESP_OK) {
+    //     speech_start();
+    // } else {
+    //     ESP_LOGW(TAG, "Speech module unavailable (check ES8311 I2C pins / esp-sr config)");
+    // }
+
+    // All ongoing work is handled by the RTSP and speech tasks.
     vTaskDelete(NULL);
 }

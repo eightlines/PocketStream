@@ -1,0 +1,1 @@
+ffplay -f lavfi -i testsrc=size=320x320:rate=5

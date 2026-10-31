@@ -10,7 +10,8 @@ CONFIG_IDF_EXPERIMENTAL_FEATURES=y
 # CPU configuration
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_360=y
 
-CONFIG_ESP_MAIN_TASK_STACK_SIZE=10240
+# AFE model loading needs extra stack headroom (was 10240)
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
 
 # FreeRTOS configurations
 CONFIG_FREERTOS_HZ=1000
@@ -25,6 +26,18 @@ CONFIG_ESP_H264_DECODER_IRAM=n
 # This case uses the terminal to print the brief diagrams before encoding and after decoding.
 # Turn off the watchdog to ensure the integrity of the picture printing
 CONFIG_ESP_TASK_WDT_EN=n
+
+# ─── Partition table ───────────────────────────────────────────────────────────
+# Custom table adds a 'model' partition required by esp-sr.
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# ─── ESP-SR / WakeNet ──────────────────────────────────────────────────────────
+# WakeNet9 with "Hi ESP" wake word.
+# Also configurable via: idf.py menuconfig
+#   → Component config → ESP Speech Recognition → Wake Word Engine
+# VAD uses WebRTC (no model data needed); only WakeNet model is packed (~289 KB).
+CONFIG_SR_WN_WN9_HIESP=y
 
 # ─── Performance ───────────────────────────────────────────────────────────────
 # -O2 instead of the debug -Og default: the YUV→RGB and scaling loops are

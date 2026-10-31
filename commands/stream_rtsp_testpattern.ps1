@@ -1,0 +1,1 @@
+ffmpeg -re -f lavfi -i testsrc=size=320x240:rate=10 -c:v libx264 -g 1 -profile:v baseline -pix_fmt yuv420p -x264-params keyint=1:min-keyint=1:scenecut=0 -preset ultrafast -tune zerolatency -f rtsp rtsp://127.0.0.1:8554/live
